@@ -22,7 +22,7 @@ async function testSearchEngine(channel, query = 'javascript programming', numRe
     const result = await searchEngine.search({
       query,
       numResults,
-      timeout: 15000 // 15 second timeout
+      timeout: 15000, // 15 second timeout
     });
     const endTime = Date.now();
 
@@ -38,7 +38,7 @@ async function testSearchEngine(channel, query = 'javascript programming', numRe
 
     console.log('📋 Results:');
     console.log('===========');
-    
+
     result.results.forEach((item, index) => {
       console.log(`${index + 1}. ${item.title}`);
       console.log(`   🔗 ${item.url}`);
@@ -47,24 +47,24 @@ async function testSearchEngine(channel, query = 'javascript programming', numRe
     });
 
     // Validate results
-    const validResults = result.results.filter(r => 
-      r.title && 
-      r.title !== 'No title' && 
-      r.url && 
-      r.url.startsWith('http') &&
-      r.description &&
-      r.description !== 'No description available'
+    const validResults = result.results.filter(
+      r =>
+        r.title &&
+        r.title !== 'No title' &&
+        r.url &&
+        r.url.startsWith('http') &&
+        r.description &&
+        r.description !== 'No description available'
     );
 
     console.log(`✅ Valid results: ${validResults.length}/${result.results.length}`);
-    
+
     if (validResults.length === 0) {
       console.log('❌ No valid results found!');
       return false;
     }
 
     return true;
-
   } catch (error) {
     console.error('❌ Search failed:', error.message);
     return false;
@@ -77,11 +77,7 @@ async function runTests(channel) {
   console.log(`🧪 Running comprehensive search engine tests (${channel || 'chromium'})...`);
   console.log('================================================');
 
-  const testQueries = [
-    'javascript programming',
-    'climate change effects',
-    'machine learning basics'
-  ];
+  const testQueries = ['javascript programming', 'climate change effects', 'machine learning basics'];
 
   let passedTests = 0;
   const totalTests = testQueries.length;
@@ -90,7 +86,7 @@ async function runTests(channel) {
     const query = testQueries[i];
     console.log(`\n🔍 Test ${i + 1}/${totalTests}: "${query}"`);
     console.log('─'.repeat(50));
-    
+
     const success = await testSearchEngine(channel, query, 5);
     if (success) {
       passedTests++;
@@ -98,7 +94,7 @@ async function runTests(channel) {
     } else {
       console.log('❌ Test FAILED');
     }
-    
+
     if (i < testQueries.length - 1) {
       console.log('\n⏳ Waiting 2 seconds before next test...');
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -109,7 +105,7 @@ async function runTests(channel) {
   console.log('===============');
   console.log(`Tests passed: ${passedTests}/${totalTests}`);
   console.log(`Success rate: ${Math.round((passedTests / totalTests) * 100)}%`);
-  
+
   if (passedTests === totalTests) {
     console.log('🎉 All tests passed!');
     return true;

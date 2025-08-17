@@ -2,9 +2,7 @@
   "mcpServers": {
     "web-search": {
       "command": "node",
-      "args": [
-        "/Users/mark/Projects/web-search-mcp/dist/simple-test.js"
-      ]
+      "args": ["/Users/mark/Projects/web-search-mcp/dist/simple-test.js"]
     }
   }
-} 
+}

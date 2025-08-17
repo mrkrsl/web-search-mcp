@@ -12,12 +12,14 @@ export class BrowserPool {
     // Read configuration from environment variables
     this.maxBrowsers = parseInt(process.env.MAX_BROWSERS || '3', 10);
     this.headless = process.env.BROWSER_HEADLESS !== 'false'; // Default to true
-    
+
     // Configure browser types based on environment
     const browserTypesEnv = process.env.BROWSER_TYPES || 'chromium,firefox';
     this.browserTypes = browserTypesEnv.split(',').map(type => type.trim());
-    
-    console.log(`[BrowserPool] Configuration: maxBrowsers=${this.maxBrowsers}, headless=${this.headless}, types=${this.browserTypes.join(',')}`);
+
+    console.log(
+      `[BrowserPool] Configuration: maxBrowsers=${this.maxBrowsers}, headless=${this.headless}, types=${this.browserTypes.join(',')}`
+    );
   }
 
   async getBrowser(): Promise<Browser> {
@@ -28,14 +30,15 @@ export class BrowserPool {
 
     if (this.browsers.has(browserType)) {
       const browser = this.browsers.get(browserType)!;
-      
+
       // Check if browser is still connected and healthy
       try {
         if (browser.isConnected()) {
           // Quick health check by trying to create and close a context
           // Use minimal options to avoid Firefox isMobile issues
           const testContext = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+            userAgent:
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
           });
           await testContext.close();
           return browser;
@@ -54,7 +57,7 @@ export class BrowserPool {
 
     // Launch new browser
     console.log(`[BrowserPool] Launching new ${browserType} browser`);
-    
+
     const launchOptions = {
       headless: this.headless,
       args: [
@@ -103,7 +106,7 @@ export class BrowserPool {
       }
 
       this.browsers.set(browserType, browser);
-      
+
       // Clean up old browsers if we have too many
       if (this.browsers.size > this.maxBrowsers) {
         const oldestBrowser = this.browsers.entries().next().value;
@@ -126,13 +129,11 @@ export class BrowserPool {
 
   async closeAll(): Promise<void> {
     console.log(`[BrowserPool] Closing ${this.browsers.size} browsers`);
-    
-    const closePromises = Array.from(this.browsers.values()).map(browser => 
-      browser.close().catch(error => 
-        console.error('Error closing browser:', error)
-      )
+
+    const closePromises = Array.from(this.browsers.values()).map(browser =>
+      browser.close().catch(error => console.error('Error closing browser:', error))
     );
-    
+
     await Promise.all(closePromises);
     this.browsers.clear();
   }

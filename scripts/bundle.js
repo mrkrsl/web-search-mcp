@@ -51,17 +51,17 @@ try {
       'combined-stream',
       'mime-types',
       'mime-db',
-      'axios'
+      'axios',
     ],
     sourcemap: true,
     minify: false, // Keep readable for debugging
     define: {
-      'process.env.NODE_ENV': '"production"'
-    }
+      'process.env.NODE_ENV': '"production"',
+    },
   });
-  
+
   console.log('✅ Bundle created: dist/bundle.js');
 } catch (error) {
   console.error('❌ Bundle failed:', error);
   process.exit(1);
-} 
+}

@@ -71,4 +71,4 @@ export default [
       'no-console': 'warn',
     },
   },
-]; 
+];

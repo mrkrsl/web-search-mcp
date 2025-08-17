@@ -5,15 +5,17 @@
 The Web Search MCP Server provides three tools for web searching and content extraction:
 
 1. **`full-web-search`** - Comprehensive web search with full content extraction (primary tool)
-2. **`get-web-search-summaries`** - Lightweight search returning only result snippets  
+2. **`get-web-search-summaries`** - Lightweight search returning only result snippets
 3. **`get-single-web-page-content`** - Extract content from a single web page URL
 
 ## Tool: full-web-search
 
 ### Description
+
 Search the web and fetch complete page content from top results. This is the most comprehensive web search tool. It searches the web and then follows the resulting links to extract their full page content, providing the most detailed and complete information available.
 
 ### Input Schema
+
 ```json
 {
   "type": "object",
@@ -45,6 +47,7 @@ Search the web and fetch complete page content from top results. This is the mos
 ```
 
 ### Output Schema
+
 Returns formatted text content containing search results with full page content:
 
 ```json
@@ -61,6 +64,7 @@ Returns formatted text content containing search results with full page content:
 ### Usage Examples
 
 #### Basic Search
+
 ```json
 {
   "name": "full-web-search",
@@ -71,6 +75,7 @@ Returns formatted text content containing search results with full page content:
 ```
 
 #### Search with Custom Parameters
+
 ```json
 {
   "name": "full-web-search",
@@ -86,9 +91,11 @@ Returns formatted text content containing search results with full page content:
 ## Tool: get-web-search-summaries
 
 ### Description
+
 Search the web and return only the search result snippets/descriptions without following links to extract full page content. This is a lightweight alternative to full-web-search for when you only need brief search results.
 
 ### Input Schema
+
 ```json
 {
   "type": "object",
@@ -110,6 +117,7 @@ Search the web and return only the search result snippets/descriptions without f
 ```
 
 ### Output Schema
+
 Returns formatted text content containing search result summaries:
 
 ```json
@@ -126,6 +134,7 @@ Returns formatted text content containing search result summaries:
 ### Usage Examples
 
 #### Basic Summary Search
+
 ```json
 {
   "name": "get-web-search-summaries",
@@ -136,6 +145,7 @@ Returns formatted text content containing search result summaries:
 ```
 
 #### Summary Search with Custom Limit
+
 ```json
 {
   "name": "get-web-search-summaries",
@@ -149,9 +159,11 @@ Returns formatted text content containing search result summaries:
 ## Tool: get-single-web-page-content
 
 ### Description
+
 Extract and return the full content from a single web page URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.
 
 ### Input Schema
+
 ```json
 {
   "type": "object",
@@ -172,6 +184,7 @@ Extract and return the full content from a single web page URL. This tool follow
 ```
 
 ### Output Schema
+
 Returns formatted text content from the specified web page:
 
 ```json
@@ -188,6 +201,7 @@ Returns formatted text content from the specified web page:
 ### Usage Examples
 
 #### Basic Page Content Extraction
+
 ```json
 {
   "name": "get-single-web-page-content",
@@ -198,6 +212,7 @@ Returns formatted text content from the specified web page:
 ```
 
 #### Page Content with Length Limit
+
 ```json
 {
   "name": "get-single-web-page-content",
@@ -211,6 +226,7 @@ Returns formatted text content from the specified web page:
 ## Response Examples
 
 ### full-web-search Response
+
 ```json
 {
   "content": [
@@ -223,6 +239,7 @@ Returns formatted text content from the specified web page:
 ```
 
 ### get-web-search-summaries Response
+
 ```json
 {
   "content": [
@@ -235,6 +252,7 @@ Returns formatted text content from the specified web page:
 ```
 
 ### get-single-web-page-content Response
+
 ```json
 {
   "content": [
@@ -266,6 +284,7 @@ Returns formatted text content from the specified web page:
    - Malformed HTML
 
 ### Error Response Format
+
 ```json
 {
   "error": {
@@ -287,11 +306,13 @@ The server implements rate limiting to respect Google's terms of service:
 ## Performance Considerations
 
 ### Response Times
+
 - Search execution: 1-5 seconds
 - Content extraction: 2-10 seconds per URL
 - Total response time: 3-15 seconds (depending on result count)
 
 ### Content Limits
+
 - Maximum content length: 50KB per page
 - Maximum concurrent requests: 5
 - Request timeout: 10 seconds
@@ -299,6 +320,7 @@ The server implements rate limiting to respect Google's terms of service:
 ## Integration Examples
 
 ### LM Studio Configuration
+
 ```json
 {
   "mcpServers": {
@@ -315,6 +337,7 @@ The server implements rate limiting to respect Google's terms of service:
 ```
 
 ### Claude Desktop Configuration
+
 ```json
 {
   "mcpServers": {
@@ -329,16 +352,19 @@ The server implements rate limiting to respect Google's terms of service:
 ## Best Practices
 
 ### Query Optimization
+
 - Use specific, descriptive queries
 - Include relevant keywords
 - Avoid overly broad searches
 
 ### Result Handling
+
 - Check for content extraction errors
 - Handle partial failures gracefully
 - Consider result relevance
 
 ### Error Recovery
+
 - Implement retry logic for transient errors
 - Provide fallback content when extraction fails
 - Log errors for debugging
@@ -363,7 +389,9 @@ The server implements rate limiting to respect Google's terms of service:
    - Check system resources
 
 ### Debug Mode
+
 Enable debug logging by setting the environment variable:
+
 ```bash
 export DEBUG=web-search-mcp:*
 ```

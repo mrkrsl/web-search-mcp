@@ -80,6 +80,18 @@ export class BrowserPool {
         case 'chromium':
           browser = await chromium.launch(launchOptions);
           break;
+        case 'edge':
+          browser = await chromium.launch({
+            ...launchOptions,
+            channel: 'msedge',
+          });
+          break;
+        case 'chrome':
+          browser = await chromium.launch({
+            ...launchOptions,
+            channel: 'chrome',
+          });
+          break;
         case 'firefox':
           browser = await firefox.launch(launchOptions);
           break;

@@ -226,14 +226,15 @@ export class SearchEngine {
         // Create a dedicated browser instance for Bing search only
         const { chromium } = await import('playwright');
         const startTime = Date.now();
+        // Support launching Chrome and Edge as branded channels
+        let channel: string | undefined;
+        const browserType = process.env.BROWSER_TYPE || null;
+        if (browserType === 'chrome') channel = 'chrome';
+        if (browserType === 'edge') channel = 'msedge';
         browser = await chromium.launch({
           headless: process.env.BROWSER_HEADLESS !== 'false',
-          args: [
-            '--no-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-          ],
+          args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--disable-gpu'],
+          ...(channel ? { channel } : {}),
         });
         
         const launchTime = Date.now() - startTime;

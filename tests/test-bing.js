@@ -2,11 +2,16 @@
 
 // Test Bing search independently
 import { chromium } from 'playwright';
+import { runMultiBrowserTest } from './test-utilities.js';
 
-async function testBing() {
-  console.log('=== TESTING BING SEARCH ===');
+async function testBingWithChannel(channel) {
+  const label = channel || 'chromium';
+  console.log(`=== TESTING BING SEARCH (${label}) ===`);
+
+  const launchOptions = { headless: true };
+  if (channel) launchOptions.channel = channel;
   
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     viewport: { width: 1366, height: 768 },
@@ -56,22 +61,18 @@ async function testBing() {
         console.log('');
       }
       
-      console.log('✅ BING SEARCH: SUCCESS');
+      console.log(`✅ BING SEARCH (${label}): SUCCESS`);
       return true;
     } else {
       console.log('❌ No results found');
       return false;
     }
-
   } catch (error) {
-    console.log(`❌ BING SEARCH FAILED: ${error.message}`);
+    console.log(`❌ BING SEARCH FAILED (${label}): ${error.message}`);
     return false;
   } finally {
     await browser.close();
   }
 }
 
-testBing().then(success => {
-  console.log(`\nBING RESULT: ${success ? 'WORKING ✅' : 'FAILED ❌'}`);
-  process.exit(success ? 0 : 1);
-});
+runMultiBrowserTest(testBingWithChannel, 'BING');

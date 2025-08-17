@@ -2,11 +2,13 @@
 
 // Simple test script to verify search functionality
 import { SearchEngine } from '../dist/search-engine.js';
+import { runMultiBrowserTest } from './test-utilities.js';
 
 const searchEngine = new SearchEngine();
 
-async function testSearch() {
-  console.log('Testing search functionality...');
+async function testSearch(channel) {
+  console.log(`Testing search functionality (${channel || 'chromium'})...`);
+  const searchEngine = new SearchEngine({ channel });
   
   try {
     const result = await searchEngine.search({
@@ -28,14 +30,12 @@ async function testSearch() {
     // Clean up
     await searchEngine.closeAll();
     
+    return result.results.length > 0;
   } catch (error) {
     console.error('Search test failed:', error);
     await searchEngine.closeAll();
-    process.exit(1);
+    return false;
   }
 }
 
-testSearch().then(() => {
-  console.log('Test completed successfully');
-  process.exit(0);
-});
+runMultiBrowserTest(testSearch, 'SEARCH');

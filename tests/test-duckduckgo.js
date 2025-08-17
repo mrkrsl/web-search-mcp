@@ -2,11 +2,14 @@
 
 // Test DuckDuckGo search independently
 import { chromium } from 'playwright';
+import { runMultiBrowserTest } from './test-utilities.js';
 
-async function testDuckDuckGo() {
-  console.log('=== TESTING DUCKDUCKGO SEARCH ===');
+async function testDuckDuckGo(channel) {
+  console.log(`=== TESTING DUCKDUCKGO SEARCH (${channel || 'chromium'}) ===`);
+  const launchOptions = { headless: true };
+  if (channel) launchOptions.channel = channel;
   
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     viewport: { width: 1366, height: 768 },
@@ -129,7 +132,4 @@ async function testDuckDuckGo() {
   }
 }
 
-testDuckDuckGo().then(success => {
-  console.log(`\nDUCKDUCKGO RESULT: ${success ? 'WORKING ✅' : 'FAILED ❌'}`);
-  process.exit(success ? 0 : 1);
-});
+runMultiBrowserTest(testDuckDuckGo, 'DUCKDUCKGO');

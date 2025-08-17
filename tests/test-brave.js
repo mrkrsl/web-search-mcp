@@ -2,11 +2,14 @@
 
 // Test Brave search independently
 import { chromium } from 'playwright';
+import { runMultiBrowserTest } from './test-utilities.js';
 
-async function testBrave() {
-  console.log('=== TESTING BRAVE SEARCH ===');
+async function testBrave(channel) {
+  console.log(`=== TESTING BRAVE SEARCH (${channel || 'chromium'}) ===`);
+  const launchOptions = { headless: true };
+  if (channel) launchOptions.channel = channel;
   
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     viewport: { width: 1366, height: 768 },
@@ -124,7 +127,4 @@ async function testBrave() {
   }
 }
 
-testBrave().then(success => {
-  console.log(`\nBRAVE RESULT: ${success ? 'WORKING ✅' : 'FAILED ❌'}`);
-  process.exit(success ? 0 : 1);
-});
+runMultiBrowserTest(testBrave, 'BRAVE');

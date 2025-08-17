@@ -6,15 +6,16 @@
  */
 
 import { SearchEngine } from '../dist/search-engine.js';
+import { runMultiBrowserTest } from './test-utilities.js';
 
-async function testSearchEngine(query = 'javascript programming', numResults = 3) {
-  console.log('🔍 Testing Web Search MCP Server - All Engines');
+async function testSearchEngine(channel, query = 'javascript programming', numResults = 3) {
+  console.log(`🔍 Testing Web Search MCP Server - All Engines (${channel || 'chromium'})`);
   console.log('===============================================');
   console.log(`Query: "${query}"`);
   console.log(`Expected results: ${numResults}`);
   console.log('');
 
-  const searchEngine = new SearchEngine();
+  const searchEngine = new SearchEngine({ channel });
 
   try {
     const startTime = Date.now();
@@ -72,8 +73,8 @@ async function testSearchEngine(query = 'javascript programming', numResults = 3
   }
 }
 
-async function runTests() {
-  console.log('🧪 Running comprehensive search engine tests...');
+async function runTests(channel) {
+  console.log(`🧪 Running comprehensive search engine tests (${channel || 'chromium'})...`);
   console.log('================================================');
 
   const testQueries = [
@@ -90,7 +91,7 @@ async function runTests() {
     console.log(`\n🔍 Test ${i + 1}/${totalTests}: "${query}"`);
     console.log('─'.repeat(50));
     
-    const success = await testSearchEngine(query, 5);
+    const success = await testSearchEngine(channel, query, 5);
     if (success) {
       passedTests++;
       console.log('✅ Test PASSED');
@@ -111,16 +112,14 @@ async function runTests() {
   
   if (passedTests === totalTests) {
     console.log('🎉 All tests passed!');
-    process.exit(0);
+    return true;
   } else {
     console.log('⚠️  Some tests failed');
-    process.exit(1);
+    return false;
   }
 }
 
-// Run tests if this script is executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
-  runTests().catch(console.error);
-}
+// Run tests across all browsers
+runMultiBrowserTest(runTests, 'ALL ENGINES');
 
 export { testSearchEngine, runTests };

@@ -11,9 +11,15 @@
   "scripts": {
     "build": "tsc && echo '✅ TypeScript compilation complete: dist/index.js'",
     "dev": "tsx watch src/index.ts",
+    "dev:streamable": "tsx watch src/streamable-server.ts",
     "start": "node ./dist/index.js",
+    "start:streamable": "node ./dist/streamable-server.js",
     "lint": "eslint \"src/**/*.ts\"",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "docker:build": "docker build -t web-search-mcp-streamable .",
+    "docker:run": "docker run -p 3001:3001 --name web-search-mcp-streamable web-search-mcp-streamable",
+    "docker:compose": "docker-compose up -d",
+    "docker:stop": "docker-compose down"
   },
   "keywords": [
     "mcp",
@@ -33,7 +39,9 @@
     "p-limit": "^6.2.0",
     "p-retry": "^6.2.1",
     "playwright": "^1.48.0",
-    "zod": "^3.22.0"
+    "zod": "^3.22.0",
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
   },
   "devDependencies": {
     "@eslint/js": "^9.30.1",
@@ -44,6 +52,8 @@
     "eslint": "^9.30.1",
     "prettier": "^3.2.5",
     "tsx": "^4.7.0",
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "@types/express": "^4.17.21",
+    "@types/cors": "^2.8.17"
   }
 }

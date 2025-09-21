@@ -1,0 +1,75 @@
+# LiteLLM Configuration for Web Search MCP Integration
+# Updated for StreamableHttp transport
+
+model_list:
+  # OpenAI models
+  - model_name: gpt-4
+    litellm_params:
+      model: openai/gpt-4
+      api_key: "your-openai-api-key"
+  
+  - model_name: gpt-3.5-turbo
+    litellm_params:
+      model: openai/gpt-3.5-turbo
+      api_key: "your-openai-api-key"
+  
+  # Anthropic models
+  - model_name: claude-3-sonnet
+    litellm_params:
+      model: anthropic/claude-3-sonnet-20240229
+      api_key: "your-anthropic-api-key"
+  
+  - model_name: claude-3-haiku
+    litellm_params:
+      model: anthropic/claude-3-haiku-20240307
+      api_key: "your-anthropic-api-key"
+
+# MCP Tools Configuration - Updated for StreamableHttp
+tools:
+  # Local development
+  - name: web-search-mcp-local
+    type: mcp
+    config:
+      transport:
+        type: http
+        url: "http://localhost:3001/mcp"
+      timeout: 30000
+  
+  # Docker container (same network)
+  - name: web-search-mcp-docker
+    type: mcp
+    config:
+      transport:
+        type: http
+        url: "http://web-search-mcp:3001/mcp"
+      timeout: 30000
+  
+  # Remote production deployment
+  - name: web-search-mcp-remote
+    type: mcp
+    config:
+      transport:
+        type: http
+        url: "https://your-domain.com/mcp"
+      timeout: 30000
+      headers:
+        Authorization: "Bearer your-optional-auth-token"
+
+# General settings
+general_settings:
+  master_key: "your-master-key-here"
+  
+  # Rate limiting
+  rpm_limit_per_user: 100
+  tpm_limit_per_user: 40000
+  
+  # Logging
+  success_callback: ["prometheus", "webhook"]
+  failure_callback: ["prometheus", "webhook"]
+
+# Router settings for load balancing
+router_settings:
+  routing_strategy: "least-busy"
+  model_group_alias:
+    gpt-4-group: ["gpt-4"]
+    claude-group: ["claude-3-sonnet", "claude-3-haiku"]

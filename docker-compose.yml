@@ -1,0 +1,43 @@
+services:
+  web-search-mcp:
+    build: .
+    container_name: web-search-mcp
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - HOST=0.0.0.0
+      # Optional environment variables for search configuration
+      # - SEARCH_TIMEOUT=30000
+      # - MAX_CONTENT_LENGTH=50000
+      # - CONCURRENT_REQUESTS=3
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    #volumes:
+      # Optional: Mount logs directory if you want persistent logs
+      # - ./logs:/app/logs
+      # Optional: Mount cache directory for browser cache
+      # - ./cache:/app/cache
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.web-search-mcp.rule=Host(`your-domain.com`)"
+      - "traefik.http.routers.web-search-mcp.entrypoints=websecure"
+      - "traefik.http.routers.web-search-mcp.tls.certresolver=letsencrypt"
+      - "traefik.http.services.web-search-mcp.loadbalancer.server.port=3001"
+      # CORS headers for MCP
+      - "traefik.http.middlewares.cors-headers.headers.accesscontrolalloworigin=*"
+      - "traefik.http.middlewares.cors-headers.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
+      - "traefik.http.middlewares.cors-headers.headers.accesscontrolallowheaders=Content-Type,Authorization,Cache-Control"
+      - "traefik.http.routers.web-search-mcp.middlewares=cors-headers"
+    networks:
+      - web-search-network
+
+networks:
+  web-search-network:
+    driver: bridge

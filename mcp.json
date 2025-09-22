@@ -1,10 +1,22 @@
 {
   "mcpServers": {
-    "web-search": {
+    "web-search-stdio": {
       "command": "node",
       "args": [
-        "/Users/mark/Projects/web-search-mcp/dist/simple-test.js"
+        "/Users/nicola/Devel/github/web-search-mcp/dist/index.js"
       ]
+    },
+    "web-search-streamable": {
+      "transport": {
+        "type": "http",
+        "url": "http://localhost:3001/mcp"
+      }
+    },
+    "web-search-streamable-remote": {
+      "transport": {
+        "type": "http", 
+        "url": "https://your-domain.com/mcp"
+      }
     }
   }
 } 

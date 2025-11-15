@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  web-search-mcp:
+    build: .
+    image: foxsnow/web-search-mcp:latest
+    container_name: web-search-mcp-server
+    # Uncomment the following lines if you need to pass environment variables
+    # environment:
+    #   - NODE_ENV=production
+    # volumes:
+    #   - ./logs:/app/logs
+    # ports:
+    #   - "3000:3000"  # Uncomment if your app exposes a port
+    stdin_open: true # Keep stdin open for MCP communication
+    tty: true # Allocate a pseudo-TTY for MCP communication
+    restart: unless-stopped

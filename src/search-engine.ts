@@ -1,7 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
-import { generateTimestamp, sanitizeQuery } from './utils.js';
+import { generateTimestamp, sanitizeQuery, buildDomainFilteredQuery, normalizeDomain, urlMatchesDomain } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
 
@@ -15,10 +15,29 @@ export class SearchEngine {
   }
 
   async search(options: SearchOptions): Promise<SearchResultWithMetadata> {
-    const { query, numResults = 5, timeout = 10000 } = options;
-    const sanitizedQuery = sanitizeQuery(query);
+    const { query, numResults = 5, timeout = 10000, domains } = options;
     
-    console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
+    // Normalize domains for filtering
+    const normalizedDomains = domains && domains.length > 0
+      ? domains.map(domain => normalizeDomain(domain)).filter(domain => domain.length > 0)
+      : [];
+    
+    // Apply domain filtering if domains are provided (but limit to 10 domains in query to avoid query length issues)
+    const filteredQuery = normalizedDomains.length > 0
+      ? buildDomainFilteredQuery(query, normalizedDomains, 10)
+      : query;
+    
+    const sanitizedQuery = sanitizeQuery(filteredQuery);
+    
+    if (normalizedDomains.length > 0) {
+      if (normalizedDomains.length > 10) {
+        console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}" (${normalizedDomains.length} domains - will filter results post-search)`);
+      } else {
+        console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}" (filtered to domains: ${normalizedDomains.join(', ')})`);
+      }
+    } else {
+      console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
+    }
     
     try {
       return await this.rateLimiter.execute(async () => {
@@ -52,42 +71,55 @@ export class SearchEngine {
             const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach for faster fallback
             const results = await approach.method(sanitizedQuery, numResults, approachTimeout);
             if (results.length > 0) {
-              console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
-              
-              // Validate result quality to detect irrelevant results
-              const qualityScore = enableQualityCheck ? this.assessResultQuality(results, sanitizedQuery) : 1.0;
-              console.log(`[SearchEngine] ${approach.name} quality score: ${qualityScore.toFixed(2)}/1.0`);
-              
-              // Track the best results so far
-              if (qualityScore > bestQuality) {
-                bestResults = results;
-                bestEngine = approach.name;
-                bestQuality = qualityScore;
+              // Filter results by domain if domains are specified
+              let filteredResults = results;
+              if (normalizedDomains.length > 0) {
+                filteredResults = results.filter(result => urlMatchesDomain(result.url, normalizedDomains));
+                if (filteredResults.length < results.length) {
+                  console.log(`[SearchEngine] Filtered ${results.length - filteredResults.length} results that didn't match specified domains`);
+                }
               }
               
-              // If quality is excellent, return immediately (unless forcing multi-engine)
-              if (qualityScore >= 0.8 && !forceMultiEngine) {
-                console.log(`[SearchEngine] Excellent quality results from ${approach.name}, returning immediately`);
-                return { results, engine: approach.name };
-              }
-              
-              // If quality is acceptable and this isn't Bing (first engine), return
-              if (qualityScore >= qualityThreshold && approach.name !== 'Browser Bing' && !forceMultiEngine) {
-                console.log(`[SearchEngine] Good quality results from ${approach.name}, using as primary`);
-                return { results, engine: approach.name };
-              }
-              
-              // If this is the last engine or quality is acceptable, prepare to return
-              if (i === approaches.length - 1) {
-                if (bestQuality >= qualityThreshold || !enableQualityCheck) {
-                  console.log(`[SearchEngine] Using best results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
-                  return { results: bestResults, engine: bestEngine };
-                } else if (bestResults.length > 0) {
-                  console.log(`[SearchEngine] Warning: Low quality results from all engines, using best available from ${bestEngine}`);
-                  return { results: bestResults, engine: bestEngine };
+              if (filteredResults.length > 0) {
+                console.log(`[SearchEngine] Found ${filteredResults.length} results with ${approach.name} (after domain filtering)`);
+                
+                // Validate result quality to detect irrelevant results
+                const qualityScore = enableQualityCheck ? this.assessResultQuality(filteredResults, sanitizedQuery) : 1.0;
+                console.log(`[SearchEngine] ${approach.name} quality score: ${qualityScore.toFixed(2)}/1.0`);
+                
+                // Track the best results so far
+                if (qualityScore > bestQuality) {
+                  bestResults = filteredResults;
+                  bestEngine = approach.name;
+                  bestQuality = qualityScore;
+                }
+                
+                // If quality is excellent, return immediately (unless forcing multi-engine)
+                if (qualityScore >= 0.8 && !forceMultiEngine) {
+                  console.log(`[SearchEngine] Excellent quality results from ${approach.name}, returning immediately`);
+                  return { results: filteredResults, engine: approach.name };
+                }
+                
+                // If quality is acceptable and this isn't Bing (first engine), return
+                if (qualityScore >= qualityThreshold && approach.name !== 'Browser Bing' && !forceMultiEngine) {
+                  console.log(`[SearchEngine] Good quality results from ${approach.name}, using as primary`);
+                  return { results: filteredResults, engine: approach.name };
+                }
+                
+                // If this is the last engine or quality is acceptable, prepare to return
+                if (i === approaches.length - 1) {
+                  if (bestQuality >= qualityThreshold || !enableQualityCheck) {
+                    console.log(`[SearchEngine] Using best results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
+                    return { results: bestResults, engine: bestEngine };
+                  } else if (bestResults.length > 0) {
+                    console.log(`[SearchEngine] Warning: Low quality results from all engines, using best available from ${bestEngine}`);
+                    return { results: bestResults, engine: bestEngine };
+                  }
+                } else {
+                  console.log(`[SearchEngine] ${approach.name} results quality: ${qualityScore.toFixed(2)}, continuing to try other engines...`);
                 }
               } else {
-                console.log(`[SearchEngine] ${approach.name} results quality: ${qualityScore.toFixed(2)}, continuing to try other engines...`);
+                console.log(`[SearchEngine] ${approach.name} returned results but none matched the specified domains`);
               }
             }
           } catch (error) {

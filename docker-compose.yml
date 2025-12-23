@@ -1,0 +1,84 @@
+services:
+
+  web-search-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: web-search-api
+    restart: unless-stopped
+    command: ["node", "./dist/api.js"]
+    ports:
+      - "3000:3000"
+    environment:
+      - MAX_CONTENT_LENGTH=500000
+      - DEFAULT_TIMEOUT=6000
+      - MAX_BROWSERS=3
+      - BROWSER_TYPES=chromium,firefox
+      - BROWSER_HEADLESS=true
+      - BROWSER_FALLBACK_THRESHOLD=3
+      - ENABLE_RELEVANCE_CHECKING=true
+      - RELEVANCE_THRESHOLD=0.3
+      - FORCE_MULTI_ENGINE_SEARCH=false
+      - DEBUG_BROWSER_LIFECYCLE=false
+      - PORT=3000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+  # web-search-mcp:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: web-search-mcp
+  #   restart: unless-stopped
+    
+  #   # Uncomment the following lines to run in API mode instead of MCP server mode
+  #   command: ["node", "./dist/api.js"]
+  #   ports:
+  #     - "3000:3000"
+    
+  #   # Environment variables (adjust as needed)
+  #   environment:
+  #     # Content and timeout settings
+  #     - MAX_CONTENT_LENGTH=500000
+  #     - DEFAULT_TIMEOUT=6000
+      
+  #     # Browser settings
+  #     - MAX_BROWSERS=3
+  #     - BROWSER_TYPES=chromium,firefox
+  #     - BROWSER_HEADLESS=true
+  #     - BROWSER_FALLBACK_THRESHOLD=3
+      
+  #     # Search quality settings
+  #     - ENABLE_RELEVANCE_CHECKING=true
+  #     - RELEVANCE_THRESHOLD=0.3
+  #     - FORCE_MULTI_ENGINE_SEARCH=false
+      
+  #     # Debug settings
+  #     - DEBUG_BROWSER_LIFECYCLE=false
+      
+  #     # API server port (only used when running in API mode)
+  #     - PORT=3000
+    
+  #   # Resource limits (adjust based on your needs)
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 2G
+  #         cpus: '1.0'
+  #       reservations:
+  #         memory: 512M
+  #         cpus: '0.5'
+    
+    # Health check (for API mode)
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 40s
+
+  # Optional: API server service (uncomment to run API server separately)
+

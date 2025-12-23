@@ -54,6 +54,7 @@ class WebSearchMCPServer {
           }
           return num;
         }).optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
+        domains: z.array(z.string()).optional().describe('Array of domains to filter search results (e.g., ["example.com", "github.com"]). Results will be limited to these domains.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: full-web-search`);
@@ -159,6 +160,7 @@ class WebSearchMCPServer {
           }
           return num;
         }).default(5).describe('Number of search results to return (1-10)'),
+        domains: z.array(z.string()).optional().describe('Array of domains to filter search results (e.g., ["example.com", "github.com"]). Results will be limited to these domains.'),
       },
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-web-search-summaries`);
@@ -186,11 +188,25 @@ class WebSearchMCPServer {
 
           console.log(`[MCP] Starting web search summaries...`);
           
+          // Handle domains array
+          let domains: string[] | undefined;
+          if (obj.domains !== undefined) {
+            if (Array.isArray(obj.domains)) {
+              domains = obj.domains.filter((d): d is string => typeof d === 'string');
+              if (domains.length === 0) {
+                domains = undefined;
+              }
+            } else {
+              throw new Error('Invalid domains: must be an array of strings');
+            }
+          }
+          
           try {
             // Use existing search engine to get results with snippets
             const searchResponse = await this.searchEngine.search({
               query: obj.query,
               numResults: limit,
+              domains,
             });
 
             // const searchTime = Date.now() - startTime; // Unused for now
@@ -354,30 +370,49 @@ class WebSearchMCPServer {
       }
     }
 
+    // Handle domains array
+    let domains: string[] | undefined;
+    if (obj.domains !== undefined) {
+      if (Array.isArray(obj.domains)) {
+        domains = obj.domains.filter((d): d is string => typeof d === 'string');
+        if (domains.length === 0) {
+          domains = undefined;
+        }
+      } else {
+        throw new Error('Invalid domains: must be an array of strings');
+      }
+    }
+
     return {
       query: obj.query,
       limit,
       includeContent,
+      domains,
     };
   }
 
   private async handleWebSearch(input: WebSearchToolInput): Promise<WebSearchToolOutput> {
     const startTime = Date.now();
-    const { query, limit = 5, includeContent = true } = input;
+    const { query, limit = 5, includeContent = true, domains } = input;
     
-    console.error(`[web-search-mcp] DEBUG: handleWebSearch called with limit=${limit}, includeContent=${includeContent}`);
+    console.error(`[web-search-mcp] DEBUG: handleWebSearch called with limit=${limit}, includeContent=${includeContent}, domains=${domains ? domains.join(', ') : 'none'}`);
 
     try {
       // Request extra search results to account for potential PDF files that will be skipped
+      // When domain filtering is active, request even more results since some will be filtered out
       // Request up to 2x the limit or at least 5 extra results, capped at 10 (Google's max)
-      const searchLimit = includeContent ? Math.min(limit * 2 + 2, 10) : limit;
+      // If domains are specified, request the maximum (10) to account for filtering
+      const searchLimit = includeContent 
+        ? (domains && domains.length > 0 ? 10 : Math.min(limit * 2 + 2, 10))
+        : (domains && domains.length > 0 ? Math.min(limit * 3, 10) : limit);
       
-      console.log(`[web-search-mcp] DEBUG: Requesting ${searchLimit} search results to get ${limit} non-PDF content results`);
+      console.log(`[web-search-mcp] DEBUG: Requesting ${searchLimit} search results to get ${limit} non-PDF content results${domains && domains.length > 0 ? ' (with domain filtering)' : ''}`);
       
       // Perform the search
       const searchResponse = await this.searchEngine.search({
         query,
         numResults: searchLimit,
+        domains,
       });
       const searchResults = searchResponse.results;
       

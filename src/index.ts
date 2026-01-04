@@ -3,6 +3,8 @@ console.log('Web Search MCP Server starting...');
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import express from 'express';
 import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
@@ -510,21 +512,83 @@ class WebSearchMCPServer {
     });
   }
 
-  async run(): Promise<void> {
+  async run(transportType: 'stdio' | 'http' = 'stdio', port: number = 8000): Promise<void> {
     console.log('Setting up MCP server...');
-    const transport = new StdioServerTransport();
     
-    console.log('Connecting to transport...');
-    await this.server.connect(transport);
-    console.log('Web Search MCP Server started');
-    console.log('Server timestamp:', new Date().toISOString());
-    console.log('Waiting for MCP messages...');
+    if (transportType === 'http') {
+      // HTTP transport using StreamableHTTPServerTransport
+      const app = express();
+      
+      // CORS middleware
+      app.use((req, res, next) => {
+        res.header('Access-Control-Allow-Origin', '*');
+        res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+        res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        if (req.method === 'OPTIONS') {
+          res.sendStatus(200);
+        } else {
+          next();
+        }
+      });
+      
+      app.use(express.json());
+      
+      // Health check endpoint
+      app.get('/health', (req, res) => {
+        res.json({ status: 'ok', timestamp: new Date().toISOString() });
+      });
+      
+      // Create streamable HTTP transport (stateless mode for easier testing)
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined, // Stateless mode - no session management
+      });
+      
+      console.log('Connecting to HTTP transport...');
+      await this.server.connect(transport);
+      
+      // Handle MCP requests (both GET for SSE and POST for direct requests)
+      app.all('/mcp', async (req, res) => {
+        try {
+          await transport.handleRequest(req, res, req.body);
+        } catch (error) {
+          console.error('HTTP MCP error:', error);
+          if (!res.headersSent) {
+            res.status(500).json({ error: 'Internal server error' });
+          }
+        }
+      });
+      
+      app.listen(port, '127.0.0.1', () => {
+        console.log(`Web Search MCP Server (HTTP) started on http://127.0.0.1:${port}/mcp`);
+        console.log('Server timestamp:', new Date().toISOString());
+        console.log('Available tools: full-web-search, get-web-search-summaries, get-single-web-page-content');
+        console.log('Waiting for MCP HTTP requests...');
+      });
+      
+    } else {
+      // Stdio transport (original behavior)
+      const transport = new StdioServerTransport();
+      
+      console.log('Connecting to stdio transport...');
+      await this.server.connect(transport);
+      console.log('Web Search MCP Server (stdio) started');
+      console.log('Server timestamp:', new Date().toISOString());
+      console.log('Waiting for MCP messages...');
+    }
   }
 }
 
+// Parse command line arguments
+const args = process.argv.slice(2);
+const transportType = args.includes('--http') ? 'http' : 'stdio';
+const portArg = args.find(arg => arg.startsWith('--port='));
+const port = portArg ? parseInt(portArg.split('=')[1], 10) : 8000;
+
+console.log(`Starting in ${transportType} mode${transportType === 'http' ? ` on port ${port}` : ''}...`);
+
 // Start the server
 const server = new WebSearchMCPServer();
-server.run().catch((error: unknown) => {
+server.run(transportType, port).catch((error: unknown) => {
   if (error instanceof Error) {
     console.error('Server error:', error.message);
   } else {

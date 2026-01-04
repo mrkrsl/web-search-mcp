@@ -11,7 +11,10 @@
   "scripts": {
     "build": "tsc && echo '✅ TypeScript compilation complete: dist/index.js'",
     "dev": "tsx watch src/index.ts",
+    "dev:http": "tsx watch src/index.ts -- --http",
     "start": "node ./dist/index.js",
+    "start:http": "node ./dist/index.js --http",
+    "start:http:port": "node ./dist/index.js --http --port=8000",
     "lint": "eslint \"src/**/*.ts\"",
     "format": "prettier --write ."
   },
@@ -28,8 +31,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.15.0",
+    "@types/express": "^5.0.6",
     "axios": "^1.6.8",
     "cheerio": "^1.0.0-rc.12",
+    "express": "^5.2.1",
     "p-limit": "^6.2.0",
     "p-retry": "^6.2.1",
     "playwright": "^1.48.0",

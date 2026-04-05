@@ -13,7 +13,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node ./dist/index.js",
     "lint": "eslint \"src/**/*.ts\"",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
   "keywords": [
     "mcp",

@@ -92,4 +92,13 @@ jspm_packages/
 .fusebox/
 
 # DynamoDB Local files
-.dynamodb/ 
+.dynamodb/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/
+
+# Backup files
+*.bak

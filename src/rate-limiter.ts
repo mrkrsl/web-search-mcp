@@ -13,26 +13,21 @@ export class RateLimiter {
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
-    // Check if we need to reset the counter
-    const now = Date.now();
-    if (now - this.lastResetTime >= this.resetIntervalMs) {
-      this.requestCount = 0;
-      this.lastResetTime = now;
-    }
+    return this.limit(async () => {
+      const now = Date.now();
+      if (now - this.lastResetTime >= this.resetIntervalMs) {
+        this.requestCount = 0;
+        this.lastResetTime = now;
+      }
 
-    // Check rate limit
-    if (this.requestCount >= this.maxRequestsPerMinute) {
-      const waitTime = this.resetIntervalMs - (now - this.lastResetTime);
-      throw new Error(`Rate limit exceeded. Please wait ${Math.ceil(waitTime / 1000)} seconds.`);
-    }
+      if (this.requestCount >= this.maxRequestsPerMinute) {
+        const waitTime = this.resetIntervalMs - (now - this.lastResetTime);
+        throw new Error(`Rate limit exceeded. Please wait ${Math.ceil(waitTime / 1000)} seconds.`);
+      }
 
-    // Execute with concurrency limit
-    const result = await this.limit(async () => {
       this.requestCount++;
-      return await fn();
+      return fn();
     });
-
-    return result;
   }
 
   getStatus(): { requestCount: number; maxRequests: number; resetTime: number } {

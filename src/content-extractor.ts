@@ -1,5 +1,5 @@
-import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { fetchText, isFetchError } from './fetch-utils.js';
 import { ContentExtractionOptions, SearchResult } from './types.js';
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 
@@ -24,7 +24,7 @@ export class ContentExtractor {
     const { url, timeout = this.defaultTimeout, maxContentLength = this.maxContentLength } = options;
     
     try {
-      const response = await axios.get(url, {
+      const response = await fetchText(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -44,7 +44,6 @@ export class ContentExtractor {
         },
         timeout,
         maxContentLength,
-        validateStatus: (status: number) => status < 400,
       });
 
       return this.parseContent(response.data);
@@ -52,10 +51,10 @@ export class ContentExtractor {
       console.error(`Content extraction error for ${url}:`, error);
       
       // If it's a 403 error, try with different headers
-      if (axios.isAxiosError(error) && error.response?.status === 403) {
+      if (isFetchError(error) && error.status === 403) {
         console.log(`[ContentExtractor] Trying alternative headers for ${url}`);
         try {
-          const response = await axios.get(url, {
+          const response = await fetchText(url, {
             headers: {
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
               'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -69,7 +68,6 @@ export class ContentExtractor {
             },
             timeout,
             maxContentLength,
-            validateStatus: (status: number) => status < 400,
           });
           
           console.log(`[ContentExtractor] Alternative headers worked for ${url}`);
@@ -236,21 +234,21 @@ export class ContentExtractor {
   }
 
   private getSpecificErrorMessage(error: unknown): string {
-    if (axios.isAxiosError(error)) {
+    if (isFetchError(error)) {
       if (error.code === 'ECONNABORTED') {
         return 'Request timeout';
       }
-      if (error.response?.status === 403) {
+      if (error.status === 403) {
         return '403 Forbidden - Access denied';
       }
-      if (error.response?.status === 404) {
+      if (error.status === 404) {
         return '404 Not found';
       }
-      if (error.message.includes('maxContentLength')) {
+      if (error.code === 'MAX_CONTENT_LENGTH_EXCEEDED' || error.message.includes('maxContentLength')) {
         return 'Content too long';
       }
-      if (error.response?.status) {
-        return `HTTP ${error.response.status}: ${error.message}`;
+      if (error.status) {
+        return `HTTP ${error.status}: ${error.message}`;
       }
       return `Network error: ${error.message}`;
     }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-console.log('Web Search MCP Server starting...');
+// MCP stdio uses stdout for protocol frames; route logs to stderr.
+console.log = console.error.bind(console);
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -274,8 +275,7 @@ class WebSearchMCPServer {
             if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
               throw new Error('Invalid maxContentLength: must be a non-negative number');
             }
-            // If maxContentLength is 0, treat it as "no limit" (undefined)
-            maxContentLength = maxLengthValue === 0 ? undefined : maxLengthValue;
+            maxContentLength = maxLengthValue;
           }
 
           console.log(`[MCP] Starting single page content extraction for: ${obj.url}`);
@@ -354,16 +354,26 @@ class WebSearchMCPServer {
       }
     }
 
+    let maxContentLength: number | undefined;
+    if (obj.maxContentLength !== undefined) {
+      const maxLengthValue = typeof obj.maxContentLength === 'string' ? parseInt(obj.maxContentLength, 10) : obj.maxContentLength;
+      if (typeof maxLengthValue !== 'number' || isNaN(maxLengthValue) || maxLengthValue < 0) {
+        throw new Error('Invalid maxContentLength: must be a non-negative number');
+      }
+      maxContentLength = maxLengthValue;
+    }
+
     return {
       query: obj.query,
       limit,
       includeContent,
+      maxContentLength,
     };
   }
 
   private async handleWebSearch(input: WebSearchToolInput): Promise<WebSearchToolOutput> {
     const startTime = Date.now();
-    const { query, limit = 5, includeContent = true } = input;
+    const { query, limit = 5, includeContent = true, maxContentLength } = input;
     
     console.error(`[web-search-mcp] DEBUG: handleWebSearch called with limit=${limit}, includeContent=${includeContent}`);
 
@@ -388,7 +398,7 @@ class WebSearchMCPServer {
 
       // Extract content from each result if requested, with target count
       const enhancedResults = includeContent 
-        ? await this.contentExtractor.extractContentForResults(searchResults, limit)
+        ? await this.contentExtractor.extractContentForResults(searchResults, limit, maxContentLength)
         : searchResults.slice(0, limit); // If not extracting content, just take the first 'limit' results
       
       // Log extraction summary with failure reasons and generate combined status

@@ -34,6 +34,7 @@ export default [
         TextEncoder: 'readonly',
         TextDecoder: 'readonly',
         AbortController: 'readonly',
+        AbortSignal: 'readonly',
         Blob: 'readonly',
         Event: 'readonly',
         EventTarget: 'readonly',
@@ -52,6 +53,7 @@ export default [
         document: 'readonly',
         Response: 'readonly',
         Request: 'readonly',
+        PermissionStatus: 'readonly',
         XMLHttpRequest: 'readonly',
         // Add more as needed
       },

@@ -62,13 +62,11 @@ async function testDuckDuckGo() {
         ];
         
         let resultElements = [];
-        let workingSelector = '';
         
         for (const selector of resultSelectors) {
           resultElements = await page.$$(selector);
           console.log(`✓ Found ${resultElements.length} elements with selector: ${selector}`);
           if (resultElements.length > 0) {
-            workingSelector = selector;
             break;
           }
         }

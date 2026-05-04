@@ -13,6 +13,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node ./dist/index.js",
     "lint": "eslint \"src/**/*.ts\"",
+    "test": "node tests/test-search.js",
     "format": "prettier --write ."
   },
   "keywords": [
@@ -28,7 +29,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.15.0",
-    "axios": "^1.6.8",
     "cheerio": "^1.0.0-rc.12",
     "p-limit": "^6.2.0",
     "p-retry": "^6.2.1",

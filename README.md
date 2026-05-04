@@ -2,12 +2,27 @@
 
 A TypeScript MCP (Model Context Protocol) server that provides comprehensive web search capabilities using direct connections (no API keys required) with multiple tools for different use cases.
 
+## Fork Changes
+
+This fork includes a few targeted changes:
+
+- Replaced `axios` with native `fetch`
+- Logs are routed away from stdout so `StdioServerTransport` does not corrupt MCP responses
+- `full-web-search` now respects the `maxContentLength` argument
+- Timed-out extractions now cancel underlying work and clean up browser contexts properly
+- Browser fallback is now gated per host via `BROWSER_FALLBACK_THRESHOLD` instead of jumping to Playwright immediately
+- Browser engines that fail to launch are disabled for the rest of the process so search can fall back cleanly
+- Bing redirect URLs are decoded more reliably before content extraction
+- Rate limiting now runs inside the concurrency gate, avoiding races under parallel load
+- Search result URL validation is stricter to avoid junk/internal links
+- Added `npm test` plus a fetch-based DuckDuckGo test path
+
 ## Features
 
 - **Multi-Engine Web Search**: Prioritises Bing > Brave > DuckDuckGo for optimal reliability and performance
 - **Full Page Content Extraction**: Fetches and extracts complete page content from search results
 - **Multiple Search Tools**: Three specialised tools for different use cases
-- **Smart Request Strategy**: Switches between playwright browesrs and fast axios requests to ensure results are returned
+- **Smart Request Strategy**: Uses fast native `fetch` requests first, then falls back to browser-based extraction if bot detection is encountered
 - **Concurrent Processing**: Extracts content from multiple pages simultaneously
 
 ## How It Works
@@ -18,9 +33,9 @@ The server provides three specialised tools for different web search needs:
 When a comprehensive search is requested, the server uses an **optimised search strategy**:
 1. **Browser-based Bing Search** - Primary method using dedicated Chromium instance
 2. **Browser-based Brave Search** - Secondary option using dedicated Firefox instance
-3. **Axios DuckDuckGo Search** - Final fallback using traditional HTTP
+3. **Fetch DuckDuckGo Search** - Final fallback using traditional HTTP
 4. **Dedicated browser isolation**: Each search engine gets its own browser instance with automatic cleanup
-5. **Content extraction**: Tries axios first, then falls back to browser with human behavior simulation
+5. **Content extraction**: Tries `fetch` first, then falls back to browser with human behavior simulation
 6. **Concurrent processing**: Extracts content from multiple pages simultaneously with timeout protection
 7. **HTTP/2 error recovery**: Automatically falls back to HTTP/1.1 when protocol errors occur
 
@@ -139,7 +154,7 @@ The server supports several environment variables for configuration:
 - **`DEFAULT_TIMEOUT`**: Default timeout for requests in milliseconds (default: 6000)
 - **`MAX_BROWSERS`**: Maximum number of browser instances to maintain (default: 3)
 - **`BROWSER_TYPES`**: Comma-separated list of browser types to use (default: 'chromium,firefox', options: chromium, firefox, webkit)
-- **`BROWSER_FALLBACK_THRESHOLD`**: Number of axios failures before using browser fallback (default: 3)
+- **`BROWSER_FALLBACK_THRESHOLD`**: Per-host number of qualifying fetch failures before using browser fallback (default: 3)
 
 ### Search Quality and Engine Selection
 

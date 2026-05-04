@@ -1,6 +1,6 @@
-import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { Page } from 'playwright';
+import { BrowserContext, Page } from 'playwright';
+import { fetchText, isFetchError } from './fetch-utils.js';
 import { ContentExtractionOptions, SearchResult } from './types.js';
 import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
@@ -8,8 +8,9 @@ import { BrowserPool } from './browser-pool.js';
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
   private readonly maxContentLength: number;
+  private readonly browserFallbackThreshold: number;
   private browserPool: BrowserPool;
-  private fallbackThreshold: number;
+  private browserFallbackFailuresByHost: Map<string, number>;
 
   constructor() {
     this.defaultTimeout = parseInt(process.env.DEFAULT_TIMEOUT || '6000', 10);
@@ -23,11 +24,14 @@ export class EnhancedContentExtractor {
       console.warn(`[EnhancedContentExtractor] Invalid MAX_CONTENT_LENGTH value: ${envMaxLength}, using default 500000`);
       this.maxContentLength = 500000;
     }
+
+    const parsedBrowserFallbackThreshold = parseInt(process.env.BROWSER_FALLBACK_THRESHOLD || '3', 10);
+    this.browserFallbackThreshold = parsedBrowserFallbackThreshold > 0 ? parsedBrowserFallbackThreshold : 3;
     
     this.browserPool = new BrowserPool();
-    this.fallbackThreshold = parseInt(process.env.BROWSER_FALLBACK_THRESHOLD || '3', 10);
+    this.browserFallbackFailuresByHost = new Map();
     
-    console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}`);
+    console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, browserFallbackThreshold=${this.browserFallbackThreshold}`);
   }
 
   async extractContent(options: ContentExtractionOptions): Promise<string> {
@@ -37,14 +41,21 @@ export class EnhancedContentExtractor {
     
     // First, try with regular HTTP client (faster)
     try {
-      const content = await this.extractWithAxios(options);
-      console.log(`[EnhancedContentExtractor] Successfully extracted with axios: ${content.length} chars`);
+      const content = await this.extractWithFetch(options);
+      this.resetBrowserFallbackFailures(url);
+      console.log(`[EnhancedContentExtractor] Successfully extracted with fetch: ${content.length} chars`);
       return content;
     } catch (error) {
-      console.log(`[EnhancedContentExtractor] Axios failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      console.log(`[EnhancedContentExtractor] Fetch failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       
       // Check if this looks like a case where browser would help
       if (this.shouldUseBrowser(error, url)) {
+        const failureCount = this.recordBrowserFallbackFailure(url);
+        if (failureCount < this.browserFallbackThreshold) {
+          console.log(`[EnhancedContentExtractor] Browser fallback threshold not reached for ${this.getBrowserFallbackHost(url)} (${failureCount}/${this.browserFallbackThreshold})`);
+          throw error;
+        }
+
         console.log(`[EnhancedContentExtractor] Falling back to headless browser for: ${url}`);
         try {
           const content = await this.extractWithBrowser(options);
@@ -52,7 +63,7 @@ export class EnhancedContentExtractor {
           return content;
         } catch (browserError) {
           console.error(`[EnhancedContentExtractor] Browser extraction also failed:`, browserError);
-          throw new Error(`Both axios and browser extraction failed for ${url}`);
+          throw new Error(`Both fetch and browser extraction failed for ${url}`);
         }
       } else {
         throw error;
@@ -60,19 +71,18 @@ export class EnhancedContentExtractor {
     }
   }
 
-  private async extractWithAxios(options: ContentExtractionOptions): Promise<string> {
-    const { url, timeout = this.defaultTimeout, maxContentLength = this.maxContentLength } = options;
+  private async extractWithFetch(options: ContentExtractionOptions): Promise<string> {
+    const { url, timeout = this.defaultTimeout, maxContentLength = this.maxContentLength, signal } = options;
     
-    const response = await axios.get(url, {
+    const response = await fetchText(url, {
       headers: this.getRandomHeaders(),
+      signal,
       timeout,
-      // Remove maxContentLength from axios config - handle truncation manually
-      validateStatus: (status: number) => status < 400,
     });
 
-    let content = this.parseContent(response.data);
+    let content = this.parseContent(response.data, maxContentLength);
     
-    // Truncate content if it exceeds the limit (instead of axios throwing an error)
+    // Truncate content if it exceeds the limit (instead of failing the request)
     if (maxContentLength && content.length > maxContentLength) {
       console.log(`[EnhancedContentExtractor] Content truncated from ${content.length} to ${maxContentLength} characters for ${url}`);
       content = content.substring(0, maxContentLength);
@@ -87,12 +97,18 @@ export class EnhancedContentExtractor {
   }
 
   private async extractWithBrowser(options: ContentExtractionOptions): Promise<string> {
-    const { url, timeout = this.defaultTimeout } = options;
+    const { url, timeout = this.defaultTimeout, maxContentLength = this.maxContentLength, signal } = options;
     
     const browser = await this.browserPool.getBrowser();
     const browserType = this.browserPool.getLastUsedBrowserType();
+    let context: BrowserContext | undefined;
+    let abortHandler: (() => void) | undefined;
     
     try {
+      if (signal?.aborted) {
+        throw new Error('Content extraction aborted');
+      }
+
       // Create context options based on browser capabilities
       const baseContextOptions = {
         userAgent: this.getRandomUserAgent(),
@@ -114,7 +130,14 @@ export class EnhancedContentExtractor {
         : { ...baseContextOptions, isMobile: Math.random() > 0.8 };
 
       // Create a new context for each request (isolation)
-      const context = await browser.newContext(contextOptions);
+      context = await browser.newContext(contextOptions);
+
+      if (signal) {
+        abortHandler = () => {
+          void context?.close().catch(() => {});
+        };
+        signal.addEventListener('abort', abortHandler, { once: true });
+      }
 
       // Add stealth scripts to avoid detection
       await context.addInitScript(() => {
@@ -180,7 +203,7 @@ export class EnhancedContentExtractor {
           
           // Create a new context with HTTP/1.1 preference
           await context.close();
-          const http1Context = await browser.newContext({
+          context = await browser.newContext({
             userAgent: this.getRandomUserAgent(),
             viewport: this.getRandomViewport(),
             locale: 'en-US',
@@ -191,7 +214,7 @@ export class EnhancedContentExtractor {
             }
           });
           
-          const http1Page = await http1Context.newPage();
+          const http1Page = await context.newPage();
           
           // Disable HTTP/2 by intercepting requests
           await http1Page.route('**/*', (route) => {
@@ -210,8 +233,7 @@ export class EnhancedContentExtractor {
           
           // Quick content extraction
           const html = await http1Page.content();
-          const content = this.parseContent(html);
-          await http1Context.close();
+          const content = this.parseContent(html, maxContentLength);
           return content;
         } else {
           throw gotoError;
@@ -233,16 +255,25 @@ export class EnhancedContentExtractor {
         console.log(`[BrowserExtractor] No main content selector found, proceeding anyway`);
       }
 
-      // Extract content using the same logic as axios version
+      // Extract content using the same parsing logic as the HTTP fetch path
       const html = await page.content();
-      const content = this.parseContent(html);
+      const content = this.parseContent(html, maxContentLength);
 
-      await context.close();
       return content;
 
     } catch (error) {
+      if (signal?.aborted) {
+        throw new Error('Content extraction aborted');
+      }
       console.error(`[BrowserExtractor] Browser extraction failed for ${url}:`, error);
       throw error;
+    } finally {
+      if (signal && abortHandler) {
+        signal.removeEventListener('abort', abortHandler);
+      }
+      if (context) {
+        await context.close().catch(() => {});
+      }
     }
   }
 
@@ -276,24 +307,24 @@ export class EnhancedContentExtractor {
   }
 
   private shouldUseBrowser(error: any, url: string): boolean {
-    // Conditions where browser is likely to succeed where axios failed
+    // Conditions where browser is likely to succeed where fetch failed
     const indicators = [
       // HTTP status codes that suggest bot detection
-      error.response?.status === 403,
-      error.response?.status === 429,
-      error.response?.status === 503,
+      error?.status === 403,
+      error?.status === 429,
+      error?.status === 503,
       
       // Error messages suggesting JS requirement
-      error.message?.includes('timeout'),
-      error.message?.includes('Access denied'),
-      error.message?.includes('Forbidden'),
-      error.message?.includes('Low quality content detected'),
+      error?.message?.includes('timeout'),
+      error?.message?.includes('Access denied'),
+      error?.message?.includes('Forbidden'),
+      error?.message?.includes('Low quality content detected'),
       
       // Response content suggesting bot detection
-      error.response?.data?.includes('Please enable JavaScript'),
-      error.response?.data?.includes('captcha'),
-      error.response?.data?.includes('unusual traffic'),
-      error.response?.data?.includes('robot'),
+      error?.body?.includes('Please enable JavaScript'),
+      error?.body?.includes('captcha'),
+      error?.body?.includes('unusual traffic'),
+      error?.body?.includes('robot'),
       
       // Sites known to be JS-heavy
       url.includes('twitter.com'),
@@ -305,6 +336,25 @@ export class EnhancedContentExtractor {
     ];
 
     return indicators.some(indicator => indicator === true);
+  }
+
+  private getBrowserFallbackHost(url: string): string {
+    try {
+      return new URL(url).hostname.toLowerCase();
+    } catch {
+      return url;
+    }
+  }
+
+  private recordBrowserFallbackFailure(url: string): number {
+    const host = this.getBrowserFallbackHost(url);
+    const failureCount = (this.browserFallbackFailuresByHost.get(host) || 0) + 1;
+    this.browserFallbackFailuresByHost.set(host, failureCount);
+    return failureCount;
+  }
+
+  private resetBrowserFallbackFailures(url: string): void {
+    this.browserFallbackFailuresByHost.delete(this.getBrowserFallbackHost(url));
   }
 
   private isLowQualityContent(content: string): boolean {
@@ -397,7 +447,7 @@ export class EnhancedContentExtractor {
     return timezones[Math.floor(Math.random() * timezones.length)];
   }
 
-  async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
+  async extractContentForResults(results: SearchResult[], targetCount: number = results.length, maxContentLength?: number): Promise<SearchResult[]> {
     console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
     
     // Filter out PDF files first
@@ -408,19 +458,22 @@ export class EnhancedContentExtractor {
     
     // Process results concurrently with timeout
     const extractionPromises = resultsToProcess.map(async (result): Promise<SearchResult> => {
+      const controller = new AbortController();
+      let timedOut = false;
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, 8000);
+
       try {
-        // Use a race condition with timeout to prevent hanging
         const extractionPromise = this.extractContent({ 
           url: result.url, 
-          timeout: 6000 // Reduced timeout to 6 seconds per page
+          timeout: 6000, // Reduced timeout to 6 seconds per page
+          maxContentLength,
+          signal: controller.signal,
         });
-        
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Content extraction timeout')), 8000);
-        });
-        
-        const content = await Promise.race([extractionPromise, timeoutPromise]);
-        const cleanedContent = cleanText(content, this.maxContentLength);
+
+        const cleanedContent = await extractionPromise;
         
         console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
         return {
@@ -432,6 +485,7 @@ export class EnhancedContentExtractor {
           fetchStatus: 'success' as const,
         };
       } catch (error) {
+        const extractionError = timedOut ? new Error('Content extraction timeout') : error;
         console.log(`[EnhancedContentExtractor] Failed to extract: ${result.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
         return {
           ...result,
@@ -440,8 +494,10 @@ export class EnhancedContentExtractor {
           wordCount: 0,
           timestamp: generateTimestamp(),
           fetchStatus: 'error' as const,
-          error: this.getSpecificErrorMessage(error),
+          error: this.getSpecificErrorMessage(extractionError),
         };
+      } finally {
+        clearTimeout(timeoutId);
       }
     });
     
@@ -462,7 +518,7 @@ export class EnhancedContentExtractor {
     return enhancedResults;
   }
 
-  private parseContent(html: string): string {
+  private parseContent(html: string, maxContentLength: number = this.maxContentLength): string {
     const $ = cheerio.load(html);
     
     // Remove all script, style, and other non-content elements
@@ -533,7 +589,9 @@ export class EnhancedContentExtractor {
     // Clean up the text
     const cleanedContent = this.cleanTextContent(mainContent);
     
-    return cleanText(cleanedContent, this.maxContentLength);
+    return maxContentLength === 0
+      ? cleanText(cleanedContent, cleanedContent.length)
+      : cleanText(cleanedContent, maxContentLength);
   }
   
   private cleanTextContent(text: string): string {
@@ -562,21 +620,21 @@ export class EnhancedContentExtractor {
   }
 
   private getSpecificErrorMessage(error: unknown): string {
-    if (axios.isAxiosError(error)) {
+    if (isFetchError(error)) {
       if (error.code === 'ECONNABORTED') {
         return 'Request timeout';
       }
-      if (error.response?.status === 403) {
+      if (error.status === 403) {
         return '403 Forbidden - Access denied';
       }
-      if (error.response?.status === 404) {
+      if (error.status === 404) {
         return '404 Not found';
       }
-      if (error.message.includes('maxContentLength')) {
+      if (error.code === 'MAX_CONTENT_LENGTH_EXCEEDED' || error.message.includes('maxContentLength')) {
         return 'Content too long';
       }
-      if (error.response?.status) {
-        return `HTTP ${error.response.status}: ${error.message}`;
+      if (error.status) {
+        return `HTTP ${error.status}: ${error.message}`;
       }
       return `Network error: ${error.message}`;
     }

@@ -51,7 +51,6 @@ try {
       'combined-stream',
       'mime-types',
       'mime-db',
-      'axios'
     ],
     sourcemap: true,
     minify: false, // Keep readable for debugging

@@ -4,6 +4,7 @@ A TypeScript MCP (Model Context Protocol) server that provides comprehensive web
 
 ## Features
 
+- **Optional Tavily API Search**: When `TAVILY_API_KEY` is set, Tavily is used as the first-priority search engine — no Playwright overhead, higher rate limits, and structured results
 - **Multi-Engine Web Search**: Prioritises Bing > Brave > DuckDuckGo for optimal reliability and performance
 - **Full Page Content Extraction**: Fetches and extracts complete page content from search results
 - **Multiple Search Tools**: Three specialised tools for different use cases
@@ -131,9 +132,32 @@ mcpServers:
 }
 ```
 
+## Optional API Key
+
+You can optionally set a **Tavily API key** to enable Tavily as the first-priority search engine. When `TAVILY_API_KEY` is set, Tavily runs before the browser-based engines, providing faster results without Playwright overhead, higher rate limits, and structured responses. If Tavily is not configured or fails, the existing Bing → Brave → DuckDuckGo waterfall runs unchanged.
+
+- Get a free API key at [app.tavily.com](https://app.tavily.com) (1,000 free credits/month)
+- Set the `TAVILY_API_KEY` environment variable in your `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": ["/path/to/web-search-mcp/dist/index.js"],
+      "env": {
+        "TAVILY_API_KEY": "tvly-YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
 ## Environment Variables
 
 The server supports several environment variables for configuration:
+
+- **`TAVILY_API_KEY`**: Optional Tavily API key — when set, enables Tavily as the first-priority search engine before browser-based engines
 
 - **`MAX_CONTENT_LENGTH`**: Maximum content length in characters (default: 500000)
 - **`DEFAULT_TIMEOUT`**: Default timeout for requests in milliseconds (default: 6000)

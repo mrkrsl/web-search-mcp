@@ -1,5 +1,6 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { tavily } from '@tavily/core';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
 import { generateTimestamp, sanitizeQuery } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
@@ -34,6 +35,7 @@ export class SearchEngine {
 
         // Try multiple approaches to get search results, starting with most reliable
         const approaches = [
+          ...(process.env.TAVILY_API_KEY ? [{ method: this.tryTavilySearch.bind(this), name: 'Tavily' }] : []),
           { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
           { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
           { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
@@ -116,6 +118,34 @@ export class SearchEngine {
 
 
 
+
+  private async tryTavilySearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying Tavily API search...`);
+
+    const apiKey = process.env.TAVILY_API_KEY;
+    if (!apiKey) {
+      throw new Error('TAVILY_API_KEY is not set');
+    }
+
+    const client = tavily({ apiKey });
+    const response = await client.search(query, {
+      maxResults: numResults,
+      searchDepth: 'basic',
+      includeRawContent: 'markdown',
+    });
+
+    const timestamp = generateTimestamp();
+    return response.results.map((result: any) => ({
+      title: result.title || '',
+      url: result.url || '',
+      description: result.content || '',
+      fullContent: result.rawContent || result.content || '',
+      contentPreview: (result.content || '').substring(0, 500),
+      wordCount: (result.rawContent || result.content || '').split(/\s+/).length,
+      timestamp,
+      fetchStatus: 'success' as const,
+    }));
+  }
 
   private async tryBrowserBraveSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
     console.log(`[SearchEngine] Trying browser-based Brave search with dedicated browser...`);

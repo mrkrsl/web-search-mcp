@@ -9,6 +9,9 @@ import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
 import { isPdfUrl } from './utils.js';
 
+// Type alias to break deep type instantiation in MCP SDK's tool() generics
+type ToolArgs = Record<string, unknown>;
+
 class WebSearchMCPServer {
   private server: McpServer;
   private searchEngine: SearchEngine;
@@ -28,34 +31,32 @@ class WebSearchMCPServer {
   }
 
   private setupTools(): void {
+    // Define schemas outside of tool() calls to avoid TS2589 deep type instantiation
+    // with @modelcontextprotocol/sdk's generic inference
+    const fullWebSearchSchema = {
+      query: z.string().describe('Search query to execute (recommended for comprehensive research)'),
+      limit: z.number().optional().describe('Number of results to return with full content (1-10, default: 5)'),
+      includeContent: z.boolean().optional().describe('Whether to fetch full page content (default: true)'),
+      maxContentLength: z.number().optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
+    } as const;
+
+    const searchSummariesSchema = {
+      query: z.string().describe('Search query to execute (lightweight alternative)'),
+      limit: z.number().optional().describe('Number of search results to return (1-10, default: 5)'),
+    } as const;
+
+    const singlePageSchema = {
+      url: z.string().url().describe('The URL of the web page to extract content from'),
+      maxContentLength: z.number().optional().describe('Maximum characters for the extracted content (0 = no limit, undefined = use default limit). Usually not needed - content length is automatically optimized.'),
+    } as const;
+
     // Register the main web search tool (primary choice for comprehensive searches)
     this.server.tool(
       'full-web-search',
       'Search the web and fetch complete page content from top results. This is the most comprehensive web search tool. It searches the web and then follows the resulting links to extract their full page content, providing the most detailed and complete information available. Use get-web-search-summaries for a lightweight alternative.',
-      {
-        query: z.string().describe('Search query to execute (recommended for comprehensive research)'),
-        limit: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1 || num > 10) {
-            throw new Error('Invalid limit: must be a number between 1 and 10');
-          }
-          return num;
-        }).default(5).describe('Number of results to return with full content (1-10)'),
-        includeContent: z.union([z.boolean(), z.string()]).transform((val) => {
-          if (typeof val === 'string') {
-            return val.toLowerCase() === 'true';
-          }
-          return Boolean(val);
-        }).default(true).describe('Whether to fetch full page content (default: true)'),
-        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxContentLength: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum characters per result content (0 = no limit). Usually not needed - content length is automatically optimized.'),
-      },
-      async (args: unknown) => {
+      fullWebSearchSchema,
+      // @ts-expect-error - TS2589: SDK v1.29 ShapeOutput inference is excessively deep with Zod schemas
+      async (args: ToolArgs) => {
         console.log(`[MCP] Tool call received: full-web-search`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
 
@@ -150,16 +151,7 @@ class WebSearchMCPServer {
     this.server.tool(
       'get-web-search-summaries',
       'Search the web and return only the search result snippets/descriptions without following links to extract full page content. This is a lightweight alternative to full-web-search for when you only need brief search results. For comprehensive information, use full-web-search instead.',
-      {
-        query: z.string().describe('Search query to execute (lightweight alternative)'),
-        limit: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 1 || num > 10) {
-            throw new Error('Invalid limit: must be a number between 1 and 10');
-          }
-          return num;
-        }).default(5).describe('Number of search results to return (1-10)'),
-      },
+      searchSummariesSchema,
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-web-search-summaries`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));
@@ -243,16 +235,7 @@ class WebSearchMCPServer {
     this.server.tool(
       'get-single-web-page-content',
       'Extract and return the full content from a single web page URL. This tool follows a provided URL and extracts the main page content. Useful for getting detailed content from a specific webpage without performing a search.',
-      {
-        url: z.string().url().describe('The URL of the web page to extract content from'),
-        maxContentLength: z.union([z.number(), z.string()]).transform((val) => {
-          const num = typeof val === 'string' ? parseInt(val, 10) : val;
-          if (isNaN(num) || num < 0) {
-            throw new Error('Invalid maxContentLength: must be a non-negative number');
-          }
-          return num;
-        }).optional().describe('Maximum characters for the extracted content (0 = no limit, undefined = use default limit). Usually not needed - content length is automatically optimized.'),
-      },
+      singlePageSchema,
       async (args: unknown) => {
         console.log(`[MCP] Tool call received: get-single-web-page-content`);
         console.log(`[MCP] Raw arguments:`, JSON.stringify(args, null, 2));

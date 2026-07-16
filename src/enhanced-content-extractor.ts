@@ -12,7 +12,7 @@ export class EnhancedContentExtractor {
   private fallbackThreshold: number;
 
   constructor() {
-    this.defaultTimeout = parseInt(process.env.DEFAULT_TIMEOUT || '6000', 10);
+    this.defaultTimeout = parseInt(process.env.DEFAULT_TIMEOUT || '15000', 10);
     
     // Read MAX_CONTENT_LENGTH from environment variable, fallback to 500KB
     const envMaxLength = process.env.MAX_CONTENT_LENGTH;
@@ -402,7 +402,7 @@ export class EnhancedContentExtractor {
     
     // Filter out PDF files first
     const nonPdfResults = results.filter(result => !isPdfUrl(result.url));
-    const resultsToProcess = nonPdfResults.slice(0, Math.min(targetCount * 2, 10)); // Process extra to account for failures
+    const resultsToProcess = nonPdfResults.slice(0, Math.min(targetCount + 2, 8)); // Process a few extra to account for failures
     
     console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results concurrently`);
     
@@ -412,22 +412,37 @@ export class EnhancedContentExtractor {
         // Use a race condition with timeout to prevent hanging
         const extractionPromise = this.extractContent({ 
           url: result.url, 
-          timeout: 6000 // Reduced timeout to 6 seconds per page
+          timeout: 15000 // 15 seconds per page to handle browser cold starts
         });
         
         const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Content extraction timeout')), 8000);
+          setTimeout(() => reject(new Error('Content extraction timeout')), 20000);
         });
         
         const content = await Promise.race([extractionPromise, timeoutPromise]);
         const cleanedContent = cleanText(content, this.maxContentLength);
+        const wordCount = getWordCount(cleanedContent);
         
-        console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
+        // Treat very thin content as a failure so it doesn't crowd out better results
+        if (wordCount < 20) {
+          console.log(`[EnhancedContentExtractor] Extracted too little content (${wordCount} words) from: ${result.url}`);
+          return {
+            ...result,
+            fullContent: cleanedContent,
+            contentPreview: getContentPreview(cleanedContent),
+            wordCount,
+            timestamp: generateTimestamp(),
+            fetchStatus: 'error' as const,
+            error: `Insufficient content extracted (${wordCount} words)`,
+          };
+        }
+        
+        console.log(`[EnhancedContentExtractor] Successfully extracted ${wordCount} words from: ${result.url}`);
         return {
           ...result,
           fullContent: cleanedContent,
           contentPreview: getContentPreview(cleanedContent),
-          wordCount: getWordCount(cleanedContent),
+          wordCount,
           timestamp: generateTimestamp(),
           fetchStatus: 'success' as const,
         };
@@ -471,11 +486,11 @@ export class EnhancedContentExtractor {
     // Remove navigation, header, footer, and other non-content elements
     $('nav, header, footer, .nav, .header, .footer, .sidebar, .menu, .breadcrumb, aside, .ad, .advertisement, .ads, .advertisement-container, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommendations, .newsletter-signup, .cookie-notice, .privacy-notice, .terms-notice, .disclaimer, .legal, .copyright, .meta, .metadata, .author-info, .publish-date, .tags, .categories, .navigation, .pagination, .search-box, .search-form, .login-form, .signup-form, .newsletter, .popup, .modal, .overlay, .tooltip, .toolbar, .ribbon, .banner, .promo, .sponsored, .affiliate, .tracking, .analytics, .pixel, .beacon').remove();
     
-    // Remove elements with common ad/tracking classes
-    $('[class*="ad"], [class*="ads"], [class*="advertisement"], [class*="tracking"], [class*="analytics"], [class*="pixel"], [class*="beacon"], [class*="sponsored"], [class*="affiliate"], [class*="promo"], [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"]').remove();
+    // Remove elements with ad/tracking classes (use exact class matches to avoid stripping .heading, .loading, etc.)
+    $('.ad-container, .ad-wrapper, .ad-slot, .ad-unit, .ad-block, .ads-container, .advertisement, .adsbygoogle, .sponsored-content, .affiliate-link, .tracking-pixel').remove();
     
-    // Remove elements with common non-content IDs
-    $('[id*="ad"], [id*="ads"], [id*="advertisement"], [id*="tracking"], [id*="analytics"], [id*="pixel"], [id*="beacon"], [id*="sponsored"], [id*="affiliate"], [id*="promo"], [id*="banner"], [id*="popup"], [id*="modal"], [id*="overlay"], [id*="tooltip"], [id*="toolbar"], [id*="ribbon"], [id*="sidebar"], [id*="navigation"], [id*="menu"], [id*="footer"], [id*="header"]').remove();
+    // Remove elements with non-content IDs (exact matches)
+    $('#ad-container, #ad-wrapper, #advertisement, #sidebar, #navigation, #footer-nav').remove();
     
     // Remove image-related elements and attributes
     $('picture, source, figure, figcaption, .image, .img, .photo, .picture, .media, .gallery, .slideshow, .carousel').remove();
@@ -544,11 +559,7 @@ export class EnhancedContentExtractor {
     text = text.replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g, ''); // Remove base64 image data
     text = text.replace(/https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff)(\?[^\s]*)?/gi, ''); // Remove image URLs
     text = text.replace(/\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff)/gi, ''); // Remove image file extensions
-    text = text.replace(/image|img|photo|picture|gallery|slideshow|carousel/gi, ''); // Remove image-related words
     text = text.replace(/click to enlarge|click for full size|view larger|download image/gi, ''); // Remove image action text
-    
-    // Remove common non-content patterns
-    text = text.replace(/cookie|privacy|terms|conditions|disclaimer|legal|copyright|all rights reserved/gi, '');
     
     // Remove excessive line breaks and spacing
     text = text.replace(/\n\s*\n/g, '\n');

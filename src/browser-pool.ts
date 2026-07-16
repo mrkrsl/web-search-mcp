@@ -13,8 +13,8 @@ export class BrowserPool {
     this.maxBrowsers = parseInt(process.env.MAX_BROWSERS || '3', 10);
     this.headless = process.env.BROWSER_HEADLESS !== 'false'; // Default to true
     
-    // Configure browser types based on environment
-    const browserTypesEnv = process.env.BROWSER_TYPES || 'chromium,firefox';
+    // Configure browser types based on environment (only firefox is installed in the container)
+    const browserTypesEnv = process.env.BROWSER_TYPES || 'firefox';
     this.browserTypes = browserTypesEnv.split(',').map(type => type.trim());
     
     console.log(`[BrowserPool] Configuration: maxBrowsers=${this.maxBrowsers}, headless=${this.headless}, types=${this.browserTypes.join(',')}`);

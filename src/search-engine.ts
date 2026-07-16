@@ -15,7 +15,7 @@ export class SearchEngine {
   }
 
   async search(options: SearchOptions): Promise<SearchResultWithMetadata> {
-    const { query, numResults = 5, timeout = 10000 } = options;
+    const { query, numResults = 5, timeout = 30000 } = options;
     const sanitizedQuery = sanitizeQuery(query);
     
     console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
@@ -49,7 +49,7 @@ export class SearchEngine {
             console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
             
             // Use more aggressive timeouts for faster fallback
-            const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach for faster fallback
+            const approachTimeout = Math.min(timeout / 3, 15000); // Max 15 seconds per approach
             const results = await approach.method(sanitizedQuery, numResults, approachTimeout);
             if (results.length > 0) {
               console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
@@ -221,18 +221,16 @@ export class SearchEngine {
     for (let attempt = 1; attempt <= 2; attempt++) {
       let browser;
       try {
-        console.error(`[SearchEngine] BING: Attempt ${attempt}/2 - Launching Chromium browser...`);
+        console.error(`[SearchEngine] BING: Attempt ${attempt}/2 - Launching Firefox browser...`);
         
         // Create a dedicated browser instance for Bing search only
-        const { chromium } = await import('playwright');
+        const { firefox } = await import('playwright');
         const startTime = Date.now();
-        browser = await chromium.launch({
+        browser = await firefox.launch({
           headless: process.env.BROWSER_HEADLESS !== 'false',
           args: [
             '--no-sandbox',
-            '--disable-blink-features=AutomationControlled',
             '--disable-dev-shm-usage',
-            '--disable-gpu',
           ],
         });
         
@@ -502,6 +500,7 @@ export class SearchEngine {
   private async tryDuckDuckGoSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
     console.log(`[SearchEngine] Trying DuckDuckGo as fallback...`);
     
+    // First try the lite HTML endpoint via axios
     try {
       const response = await axios.get('https://html.duckduckgo.com/html/', {
         params: {
@@ -522,14 +521,143 @@ export class SearchEngine {
 
       console.log(`[SearchEngine] DuckDuckGo got response with status: ${response.status}`);
       
-      const results = this.parseDuckDuckGoResults(response.data, numResults);
-      console.log(`[SearchEngine] DuckDuckGo parsed ${results.length} results`);
-      
-      return results;
-    } catch {
-      console.error(`[SearchEngine] DuckDuckGo search failed`);
-      throw new Error('DuckDuckGo search failed');
+      // If we got a 202 or the response contains CAPTCHA/anomaly, fall through to browser
+      if (response.status === 202 || (response.data && response.data.includes('anomaly'))) {
+        console.log(`[SearchEngine] DuckDuckGo returned CAPTCHA/challenge (status ${response.status}), falling back to browser...`);
+      } else {
+        const results = this.parseDuckDuckGoResults(response.data, numResults);
+        console.log(`[SearchEngine] DuckDuckGo parsed ${results.length} results`);
+        if (results.length > 0) {
+          return results;
+        }
+        console.log(`[SearchEngine] DuckDuckGo axios returned 0 results, trying browser...`);
+      }
+    } catch (axiosError) {
+      console.log(`[SearchEngine] DuckDuckGo axios failed, trying browser fallback...`);
     }
+
+    // Browser-based DuckDuckGo fallback
+    return this.tryBrowserDuckDuckGoSearch(query, numResults, timeout);
+  }
+
+  private async tryBrowserDuckDuckGoSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying browser-based DuckDuckGo search...`);
+    let browser;
+    try {
+      const { firefox } = await import('playwright');
+      browser = await firefox.launch({
+        headless: process.env.BROWSER_HEADLESS !== 'false',
+        args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      });
+
+      const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        viewport: { width: 1366, height: 768 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
+      });
+
+      const page = await context.newPage();
+      const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query)}&t=h_&ia=web`;
+      console.log(`[SearchEngine] Browser DuckDuckGo navigating to: ${searchUrl}`);
+
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout });
+
+      // Wait for results to render (DDG is a JS SPA)
+      try {
+        await page.waitForSelector('[data-testid="result"], article[data-nrn="result"], .react-results--main li', { timeout: 5000 });
+      } catch {
+        console.log(`[SearchEngine] Browser DuckDuckGo results selector not found, proceeding anyway`);
+      }
+
+      const html = await page.content();
+      console.log(`[SearchEngine] Browser DuckDuckGo got HTML with length: ${html.length}`);
+
+      await context.close();
+      await browser.close();
+      browser = null;
+
+      const results = this.parseBrowserDuckDuckGoResults(html, numResults);
+      console.log(`[SearchEngine] Browser DuckDuckGo parsed ${results.length} results`);
+      return results;
+    } catch (error) {
+      console.error(`[SearchEngine] Browser DuckDuckGo failed:`, error);
+      throw error;
+    } finally {
+      if (browser) {
+        try { await browser.close(); } catch {}
+      }
+    }
+  }
+
+  private parseBrowserDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
+    console.log(`[SearchEngine] Parsing browser DuckDuckGo HTML with length: ${html.length}`);
+    const $ = cheerio.load(html);
+    const results: SearchResult[] = [];
+    const timestamp = generateTimestamp();
+
+    // DDG SPA uses various result containers
+    const resultSelectors = [
+      '[data-testid="result"]',
+      'article[data-nrn="result"]',
+      '.react-results--main li[data-layout="organic"]',
+      'li[data-layout="organic"]',
+      'ol.react-results--main > li',
+    ];
+
+    for (const selector of resultSelectors) {
+      if (results.length >= maxResults) break;
+      const elements = $(selector);
+      console.log(`[SearchEngine] Browser DDG trying selector ${selector}: ${elements.length} elements`);
+
+      elements.each((_index, element) => {
+        if (results.length >= maxResults) return false;
+        const $el = $(element);
+
+        // Title + URL: look for the main heading link
+        let title = '';
+        let url = '';
+        const $link = $el.find('a[data-testid="result-title-a"], h2 a, a[href^="http"]').first();
+        if ($link.length) {
+          title = $link.text().trim();
+          url = $link.attr('href') || '';
+        }
+
+        // Snippet
+        let snippet = '';
+        const $snippet = $el.find('[data-result="snippet"], .OgdwYG6KE2c-, span.kY2IgmnCmOGjharHErah').first();
+        if ($snippet.length) {
+          snippet = $snippet.text().trim();
+        }
+        if (!snippet) {
+          // Fallback: any <span> that looks like a description
+          $el.find('span').each((_, span) => {
+            const text = $(span).text().trim();
+            if (text.length > 50 && !snippet) {
+              snippet = text;
+            }
+          });
+        }
+
+        if (title && url && url.startsWith('http') && !url.includes('duckduckgo.com')) {
+          results.push({
+            title,
+            url,
+            description: snippet || 'No description available',
+            fullContent: '',
+            contentPreview: '',
+            wordCount: 0,
+            timestamp,
+            fetchStatus: 'success',
+          });
+        }
+      });
+
+      if (results.length > 0) break;
+    }
+
+    console.log(`[SearchEngine] Browser DuckDuckGo found ${results.length} results`);
+    return results;
   }
 
   private parseSearchResults(html: string, maxResults: number): SearchResult[] {
@@ -685,11 +813,10 @@ export class SearchEngine {
     const results: SearchResult[] = [];
     const timestamp = generateTimestamp();
 
-    // Brave result selectors
+    // Brave uses Svelte; the main result wrapper is .snippet[data-type="web"]
     const resultSelectors = [
-      '[data-type="web"]',     // Main Brave results
-      '.result',               // Alternative format
-      '.fdb'                   // Brave specific format
+      '.snippet[data-type="web"]',  // Current Brave Svelte structure
+      '[data-type="web"]',          // Fallback without .snippet
     ];
     
     let foundResults = false;
@@ -706,13 +833,12 @@ export class SearchEngine {
 
         const $element = $(element);
         
-        // Try multiple title selectors for Brave
+        // Current Brave structure: <a href="..."> wraps <div class="title search-snippet-title">Title</div>
         const titleSelectors = [
-          '.title a',              // Brave specific
-          'h2 a',                  // Common format  
-          '.result-title a',       // Alternative format
-          'a[href*="://"]',        // Any external link
-          '.snippet-title a'       // Snippet title
+          '.search-snippet-title',     // Current Brave Svelte title class
+          '.title',                    // Generic title class
+          'a .heading',                // Heading inside link
+          'h2 a',                      // Fallback h2 link
         ];
         
         let title = '';
@@ -722,7 +848,16 @@ export class SearchEngine {
           const $titleElement = $element.find(titleSelector).first();
           if ($titleElement.length) {
             title = $titleElement.text().trim();
-            url = $titleElement.attr('href') || '';
+            // The <a> wraps the title div, so look for the closest <a> parent or the link itself
+            const $link = $titleElement.closest('a[href]');
+            if ($link.length) {
+              url = $link.attr('href') || '';
+            }
+            if (!url) {
+              // Try finding any external link in the result
+              const $anyLink = $element.find('a[href^="http"]').first();
+              url = $anyLink.attr('href') || '';
+            }
             console.log(`[SearchEngine] Brave found title with ${titleSelector}: "${title}"`);
             if (title && url && url.startsWith('http')) {
               break;
@@ -730,22 +865,12 @@ export class SearchEngine {
           }
         }
         
-        // If still no title, try getting it from any text content
-        if (!title) {
-          const textContent = $element.text().trim();
-          const lines = textContent.split('\n').filter(line => line.trim().length > 0);
-          if (lines.length > 0) {
-            title = lines[0].trim();
-            console.log(`[SearchEngine] Brave found title from text content: "${title}"`);
-          }
-        }
-        
-        // Try multiple snippet selectors for Brave
+        // Snippet lives in .generic-snippet .content
         const snippetSelectors = [
-          '.snippet-content',      // Brave specific
-          '.snippet',              // Generic
-          '.description',          // Alternative
-          'p'                      // Fallback paragraph
+          '.generic-snippet .content', // Current Brave Svelte snippet
+          '.generic-snippet',          // Wrapper fallback
+          '.snippet-content',          // Legacy
+          '.description',              // Alternative
         ];
         
         let snippet = '';
@@ -753,7 +878,7 @@ export class SearchEngine {
           const $snippetElement = $element.find(snippetSelector).first();
           if ($snippetElement.length) {
             snippet = $snippetElement.text().trim();
-            break;
+            if (snippet) break;
           }
         }
         
@@ -980,12 +1105,29 @@ export class SearchEngine {
   }
 
   private cleanBingUrl(url: string): string {
-    // Bing URLs are usually direct, but check for any redirect patterns
+    // Bing wraps results in redirect URLs like:
+    // https://www.bing.com/ck/a?...&u=a1aHR0cHM6Ly93d3cuZXhhbXBsZS5jb20v...
+    // The 'u' param is "a1" + base64(actualUrl)
+    if (url.includes('bing.com/ck/a')) {
+      try {
+        const urlObj = new URL(url);
+        const uParam = urlObj.searchParams.get('u');
+        if (uParam && uParam.startsWith('a1')) {
+          const decoded = Buffer.from(uParam.substring(2), 'base64').toString('utf-8');
+          if (decoded.startsWith('http')) {
+            console.log(`[SearchEngine] Decoded Bing URL: ${decoded}`);
+            return decoded;
+          }
+        }
+      } catch (e) {
+        console.log(`[SearchEngine] Failed to decode Bing redirect URL: ${url}`);
+      }
+    }
+
     if (url.startsWith('//')) {
       return 'https:' + url;
     }
     
-    // If it's already a full URL, return as-is
     if (url.startsWith('http://') || url.startsWith('https://')) {
       return url;
     }

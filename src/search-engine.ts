@@ -34,6 +34,7 @@ export class SearchEngine {
 
         // Try multiple approaches to get search results, starting with most reliable
         const approaches = [
+          { method: this.tryYouComSearch.bind(this), name: 'You.com API' },
           { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
           { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
           { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
@@ -530,6 +531,91 @@ export class SearchEngine {
       console.error(`[SearchEngine] DuckDuckGo search failed`);
       throw new Error('DuckDuckGo search failed');
     }
+  }
+
+  private async tryYouComSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying You.com API search...`);
+    
+    const apiKey = process.env.YDC_API_KEY;
+    const baseUrl = 'https://api.you.com/v1/agents/search';
+    
+    try {
+      const config: any = {
+        params: {
+          query,
+          count: numResults
+        },
+        headers: {
+          'User-Agent': 'youdotcom-integration/mrkrsl-web-search-mcp',
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        timeout,
+        validateStatus: (status: number) => status < 400,
+      };
+
+      // Add API key if available
+      if (apiKey) {
+        config.headers['Authorization'] = `Bearer ${apiKey}`;
+        console.log(`[SearchEngine] Using You.com API with authentication`);
+      } else {
+        console.log(`[SearchEngine] Using You.com API without authentication (keyless tier)`);
+      }
+
+      const response = await axios.get(baseUrl, config);
+      console.log(`[SearchEngine] You.com got response with status: ${response.status}`);
+      
+      const results = this.parseYouComResults(response.data, numResults);
+      console.log(`[SearchEngine] You.com parsed ${results.length} results`);
+      
+      return results;
+    } catch (error: any) {
+      console.error(`[SearchEngine] You.com search failed:`, error.message);
+      
+      // Handle specific error cases
+      if (error.response?.status === 402) {
+        throw new Error('You.com API quota exceeded - consider adding YDC_API_KEY');
+      } else if (error.response?.status === 401) {
+        throw new Error('You.com API authentication failed - check YDC_API_KEY');
+      }
+      
+      throw new Error('You.com search failed');
+    }
+  }
+
+  private parseYouComResults(data: any, maxResults: number): SearchResult[] {
+    console.log(`[SearchEngine] Parsing You.com response data`);
+    
+    const results: SearchResult[] = [];
+    const timestamp = generateTimestamp();
+
+    try {
+      // You.com API returns results in data.results.web array
+      const webResults = data?.results?.web || [];
+      console.log(`[SearchEngine] Found ${webResults.length} You.com web results`);
+
+      for (let i = 0; i < Math.min(webResults.length, maxResults); i++) {
+        const item = webResults[i];
+        
+        if (item.title && item.url && this.isValidSearchUrl(item.url)) {
+          console.log(`[SearchEngine] You.com found: "${item.title}" -> "${item.url}"`);
+          results.push({
+            title: item.title.trim(),
+            url: item.url,
+            description: item.description || item.snippet || 'No description available',
+            fullContent: '',
+            contentPreview: '',
+            wordCount: 0,
+            timestamp,
+            fetchStatus: 'success',
+          });
+        }
+      }
+    } catch (error) {
+      console.error(`[SearchEngine] Error parsing You.com results:`, error);
+    }
+
+    return results;
   }
 
   private parseSearchResults(html: string, maxResults: number): SearchResult[] {

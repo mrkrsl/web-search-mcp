@@ -1,0 +1,32 @@
+name: MCP Contract Check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  contract-check:
+    name: MCP Contract Check & Schema Fuzzing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+      - name: Run MCP Contract & Schema Fuzz Check
+        uses: gendjo-owlhead/mcp-contract-check@v1
+        with:
+          command: "node dist/index.js"
+          fuzz: "true"

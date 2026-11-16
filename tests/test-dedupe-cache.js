@@ -12,6 +12,7 @@ import { normalizeForDedupe, envInt, envTtlMinutes } from '../dist/utils.js';
 import { TtlCache, SingleFlight } from '../dist/cache.js';
 import { SearchEngine } from '../dist/search-engine.js';
 import { EnhancedContentExtractor } from '../dist/enhanced-content-extractor.js';
+import { BrowserPool } from '../dist/browser-pool.js';
 
 let passed = 0;
 const failures = [];
@@ -386,6 +387,53 @@ await test('NO_CACHE=true refetches the page on every call', async () => {
   await extractor.extractContent({ url: 'https://example.com/nocache' });
   assert.equal(calls, 2);
   delete process.env.NO_CACHE;
+});
+
+// ---------------------------------------------------------------- browser idle close
+console.log('\nBrowserPool idle close (fake browsers, nothing launched)');
+
+const fakeBrowser = (log, name) => ({
+  isConnected: () => true,
+  close: async () => { log.push(name); },
+});
+
+await test('a browser unused past BROWSER_IDLE_TIMEOUT_SECONDS is released, a fresh one is kept', async () => {
+  process.env.BROWSER_IDLE_TIMEOUT_SECONDS = '1';
+  const pool = new BrowserPool();
+  const closed = [];
+  pool.browsers.set('chromium', fakeBrowser(closed, 'chromium'));
+  pool.browsers.set('firefox', fakeBrowser(closed, 'firefox'));
+  pool.lastUsedAt.set('chromium', Date.now() - 5000); // stale
+  pool.lastUsedAt.set('firefox', Date.now());         // just used
+
+  const n = await pool.closeIdleBrowsers();
+  assert.equal(n, 1, `closed ${n}, expected only the stale one`);
+  assert.deepEqual(closed, ['chromium']);
+  assert.equal(pool.size, 1, 'the busy browser must stay in the pool');
+  await pool.closeAll();
+  assert.equal(pool.size, 0, 'closeAll empties the pool');
+  delete process.env.BROWSER_IDLE_TIMEOUT_SECONDS;
+});
+
+await test('BROWSER_IDLE_TIMEOUT_SECONDS=0 switches idle close off', async () => {
+  process.env.BROWSER_IDLE_TIMEOUT_SECONDS = '0';
+  const pool = new BrowserPool();
+  const closed = [];
+  pool.browsers.set('chromium', fakeBrowser(closed, 'chromium'));
+  pool.lastUsedAt.set('chromium', Date.now() - 3_600_000);
+  assert.equal(pool.idleTimer, undefined, 'no sweeper may be scheduled when disabled');
+  assert.equal(await pool.closeIdleBrowsers(), 0);
+  assert.deepEqual(closed, []);
+  await pool.closeAll();
+  delete process.env.BROWSER_IDLE_TIMEOUT_SECONDS;
+});
+
+await test('the default idle window is 30 minutes', () => {
+  const pool = new BrowserPool();
+  assert.equal(pool.idleTimeoutMs, 1_800_000, `idleTimeoutMs=${pool.idleTimeoutMs}`);
+  // the sweep timer is unref'd, so it cannot keep the server alive on its own
+  assert.ok(pool.idleTimer && pool.idleTimer.hasRef?.() === false, 'idle timer must be unref\'d');
+  void pool.closeAll();
 });
 
 // ---------------------------------------------------------------- throttle

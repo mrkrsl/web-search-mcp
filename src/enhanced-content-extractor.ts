@@ -237,6 +237,14 @@ export class EnhancedContentExtractor {
       const html = await page.content();
       const content = this.parseContent(html);
 
+      // The axios path already rejects bot-protection pages; the browser path did not, so a
+      // Cloudflare interstitial was returned as if it were the article (observed as a 516 char
+      // "Why have I been blocked?" body reported as a successful extraction).
+      if (this.isBlockPage(content)) {
+        await context.close();
+        throw new Error(`Bot protection interstitial detected for ${url} - the page was not extracted`);
+      }
+
       await context.close();
       return content;
 
@@ -307,14 +315,44 @@ export class EnhancedContentExtractor {
     return indicators.some(indicator => indicator === true);
   }
 
+  /**
+   * Fingerprints of anti-bot interstitials (Cloudflare, Akamai, Wordfence...). Phrases, not bare
+   * words: "captcha"/"robot" appear constantly in legitimate security documentation, and short
+   * matches there would reject real articles.
+   */
+  private isBlockPage(content: string): boolean {
+    const text = content.toLowerCase();
+
+    const markers = [
+      'why have i been blocked',
+      'security service to protect itself',
+      'triggered the security solution',
+      'attention required! this website',
+      'verifying you are human',
+      'checking your browser before connecting',
+      'enable javascript and cookies to continue',
+      'pardon our interruption',
+      'blocked by network security',
+      'access denied',
+      '403 forbidden',
+      'please enable javascript',
+      'unusual traffic',
+      'select all squares',
+      'enter the code you see above',
+    ];
+
+    return markers.some((marker) => text.includes(marker));
+  }
+
   private isLowQualityContent(content: string): boolean {
+    if (this.isBlockPage(content)) {
+      console.log(`[EnhancedContentExtractor] Detected a bot-protection interstitial, not article content`);
+      return true;
+    }
+
     const lowQualityIndicators = [
       content.length < 100,
-      content.includes('Please enable JavaScript'),
-      content.includes('Access Denied'),
-      content.includes('403 Forbidden'),
       content.includes('captcha'),
-      content.includes('unusual traffic'),
       content.includes('robot'),
       content.trim() === '',
     ];

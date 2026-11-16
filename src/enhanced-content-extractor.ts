@@ -2,7 +2,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult } from './types.js';
-import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
+import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl, userAgentFor } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
 
 export class EnhancedContentExtractor {
@@ -95,7 +95,7 @@ export class EnhancedContentExtractor {
     try {
       // Create context options based on browser capabilities
       const baseContextOptions = {
-        userAgent: this.getRandomUserAgent(),
+        userAgent: await this.resolveUserAgent(browser),
         viewport: this.getRandomViewport(),
         locale: 'en-US',
         timezoneId: this.getRandomTimezone(),
@@ -181,7 +181,7 @@ export class EnhancedContentExtractor {
           // Create a new context with HTTP/1.1 preference
           await context.close();
           const http1Context = await browser.newContext({
-            userAgent: this.getRandomUserAgent(),
+            userAgent: await this.resolveUserAgent(browser),
             viewport: this.getRandomViewport(),
             locale: 'en-US',
             timezoneId: this.getRandomTimezone(),
@@ -360,6 +360,19 @@ export class EnhancedContentExtractor {
     };
   }
 
+  /**
+   * A UA that contradicts the engine actually running (Chrome/121 string on Chrome/156, or a
+   * Chrome UA on Firefox) is itself a detection signal, so when the browser reports its version
+   * build a matching UA and only fall back to the random list otherwise.
+   */
+  private async resolveUserAgent(browser: { browserType: () => { name: () => string }; version: () => string }): Promise<string> {
+    try {
+      return userAgentFor(browser.browserType().name(), browser.version());
+    } catch {
+      return this.getRandomUserAgent();
+    }
+  }
+
   private getRandomUserAgent(): string {
     const userAgents = [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -462,20 +475,114 @@ export class EnhancedContentExtractor {
     return enhancedResults;
   }
 
+  /**
+   * Words that mark a class/ID as page chrome rather than article text. Matched against whole
+   * tokens (split on -, _, space, camelCase boundaries), so `mw-header` is dropped but a class
+   * like `download-links` or `grade-scale` is not.
+   */
+  private static readonly NOISE_TOKENS = new Set([
+    'ad', 'ads', 'advert', 'advertisement', 'advertisements', 'adunit', 'adsense', 'tracking', 'tracker',
+    'analytics', 'pixel', 'beacon', 'sponsored', 'affiliate', 'affiliates', 'promo', 'promotion',
+    'banner', 'banners', 'popup', 'popups', 'modal', 'overlay', 'tooltip', 'toolbar', 'ribbon',
+    'sidebar', 'sidebars', 'navigation', 'nav', 'menu', 'menubar', 'footer', 'header', 'topbar',
+    'breadcrumb', 'breadcrumbs', 'share', 'sharing', 'social', 'newsletter', 'subscribe', 'subscription',
+    'comment', 'comments', 'disclaimer', 'cookie', 'cookies', 'privacy', 'terms', 'legal', 'copyright',
+    'login', 'signin', 'signup', 'search', 'searchbox', 'pagination', 'pager', 'related', 'recommendations',
+    'metadata', 'byline', 'tags', 'categories'
+  ]);
+
+  private tokenizeClass(value: string): string[] {
+    return value
+      .toLowerCase()
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean);
+  }
+
+  /**
+   * Token-aware removal of ad/navigation chrome. Safe by construction:
+   *  - only whole tokens are compared (no `*="ad"` substring matching)
+   *  - structural/root elements are never removed
+   *  - an element carrying more than 40% of the page text is kept (it is the article wrapper,
+   *    not an ad slot)
+   */
+  private removeNoiseElements($: cheerio.CheerioAPI): void {
+    const bodyTextLength = $('body').text().trim().length || $('html').text().trim().length || 1;
+
+    for (const attribute of ['class', 'id'] as const) {
+      $(`[${attribute}]`).each((_index, element) => {
+        const $element = $(element);
+        const raw = $element.attr(attribute);
+        if (!raw) return;
+        if (!this.tokenizeClass(raw).some(token => EnhancedContentExtractor.NOISE_TOKENS.has(token))) return;
+
+        const tagName = (element as any).tagName?.toString().toLowerCase() ?? '';
+        if (tagName === 'html' || tagName === 'body') return;
+        if ($element.is('main, article, [role="main"]')) return;
+
+        const elementTextLength = $element.text().trim().length;
+        if (elementTextLength / bodyTextLength > 0.4) return; // wraps the real content
+
+        $element.remove();
+      });
+    }
+  }
+
+  /**
+   * Fallback extraction: re-parse the raw HTML and return the text of the container with the
+   * highest amount of readable text (classic readability heuristic, link-density penalised).
+   */
+  private extractDensestTextBlock(html: string): string {
+    try {
+      const $ = cheerio.load(html);
+      $('script, style, noscript, template, svg, code, kbd').remove();
+
+      let best = '';
+      let bestScore = 0;
+      let considered = 0;
+
+      $('article, main, [role="main"], section, div, td').each((_index, element) => {
+        if (considered++ > 3000) return false;
+        const $element = $(element);
+        const text = $element.text().replace(/\s+/g, ' ').trim();
+        if (text.length < 200) return;
+
+        const linkText = $element.find('a').toArray().reduce((sum, a) => sum + $(a).text().trim().length, 0);
+        const linkDensity = Math.min(linkText / text.length, 1);
+        const score = text.length * (1 - linkDensity);
+
+        if (score > bestScore) {
+          bestScore = score;
+          best = text;
+        }
+      });
+
+      if (best) {
+        console.log(`[EnhancedContentExtractor] Densest text block: ${best.length} chars (score ${Math.round(bestScore)})`);
+      }
+      return best;
+    } catch {
+      return '';
+    }
+  }
+
   private parseContent(html: string): string {
     const $ = cheerio.load(html);
     
     // Remove all script, style, and other non-content elements
     $('script, style, noscript, iframe, img, video, audio, canvas, svg, object, embed, applet, form, input, textarea, select, button, label, fieldset, legend, optgroup, option').remove();
     
-    // Remove navigation, header, footer, and other non-content elements
-    $('nav, header, footer, .nav, .header, .footer, .sidebar, .menu, .breadcrumb, aside, .ad, .advertisement, .ads, .advertisement-container, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommendations, .newsletter-signup, .cookie-notice, .privacy-notice, .terms-notice, .disclaimer, .legal, .copyright, .meta, .metadata, .author-info, .publish-date, .tags, .categories, .navigation, .pagination, .search-box, .search-form, .login-form, .signup-form, .newsletter, .popup, .modal, .overlay, .tooltip, .toolbar, .ribbon, .banner, .promo, .sponsored, .affiliate, .tracking, .analytics, .pixel, .beacon').remove();
+    // Remove block-level navigation chrome (tag level). Class/ID based noise is handled by
+    // removeNoiseElements() below, which is token-aware and protects content wrappers.
+    $('nav, header, footer').remove();
     
-    // Remove elements with common ad/tracking classes
-    $('[class*="ad"], [class*="ads"], [class*="advertisement"], [class*="tracking"], [class*="analytics"], [class*="pixel"], [class*="beacon"], [class*="sponsored"], [class*="affiliate"], [class*="promo"], [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"]').remove();
-    
-    // Remove elements with common non-content IDs
-    $('[id*="ad"], [id*="ads"], [id*="advertisement"], [id*="tracking"], [id*="analytics"], [id*="pixel"], [id*="beacon"], [id*="sponsored"], [id*="affiliate"], [id*="promo"], [id*="banner"], [id*="popup"], [id*="modal"], [id*="overlay"], [id*="tooltip"], [id*="toolbar"], [id*="ribbon"], [id*="sidebar"], [id*="navigation"], [id*="menu"], [id*="footer"], [id*="header"]').remove();
+    // Remove elements whose class/ID *tokens* mark them as ad/tracking/chrome noise.
+    // NOTE: this deliberately does NOT use `[class*="ad"]` style substring matching: the
+    // substring "ad" also occurs in totally innocent names ("header", "grade", "download"...),
+    // which used to delete whole sites (e.g. every Wikipedia article, because `mw-header-*`
+    // wraps the page). Matching is per word/token and never removes an element that holds
+    // most of the page text.
+    this.removeNoiseElements($);
     
     // Remove image-related elements and attributes
     $('picture, source, figure, figcaption, .image, .img, .photo, .picture, .media, .gallery, .slideshow, .carousel').remove();
@@ -528,6 +635,13 @@ export class EnhancedContentExtractor {
     if (!mainContent || mainContent.length < 100) {
       console.log(`[EnhancedContentExtractor] No main content found, using body content`);
       mainContent = $('body').text().trim();
+    }
+
+    // Last resort: the filters above (or a weird DOM) left us with nothing usable - re-parse the
+    // untouched HTML and take the densest text block instead of returning an empty page.
+    if (!mainContent || mainContent.length < 100) {
+      console.log(`[EnhancedContentExtractor] Body content unusable, falling back to densest text block`);
+      mainContent = this.extractDensestTextBlock(html);
     }
     
     // Clean up the text

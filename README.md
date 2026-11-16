@@ -2,6 +2,12 @@
 
 A TypeScript MCP (Model Context Protocol) server that provides comprehensive web search capabilities using direct connections (no API keys required) with multiple tools for different use cases.
 
+## Platform
+
+- **Debian 13 (Trixie) native**: Playwright 1.65.1+ ships Debian 13 browser builds (no Ubuntu 20.04 fallback).
+- Chromium, Firefox and WebKit start without extra library workarounds.
+- Prefers the system Chrome when available (`BROWSER_CHANNEL=auto`).
+
 ## Features
 
 - **Multi-Engine Web Search**: Prioritises configured API providers (SearXNG / Serper / Brave API / Tavily) over the free engines, then DuckDuckGo > Bing > Brave
@@ -9,6 +15,7 @@ A TypeScript MCP (Model Context Protocol) server that provides comprehensive web
 - **Multiple Search Tools**: Three specialised tools for different use cases
 - **Smart Request Strategy**: Switches between playwright browesrs and fast axios requests to ensure results are returned
 - **Concurrent Processing**: Extracts content from multiple pages simultaneously
+- **Debian 13 ready**: latest stable Playwright (1.65.1+) with native Debian 13 browser builds; no legacy Ubuntu fallbacks
 
 ## How It Works
 

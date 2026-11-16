@@ -1,13 +1,16 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
-import { generateTimestamp, sanitizeQuery } from './utils.js';
+import { generateTimestamp, sanitizeQuery, getChromiumLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs, userAgentFor } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
 
 export class SearchEngine {
   private readonly rateLimiter: RateLimiter;
   private browserPool: BrowserPool;
+  // When DuckDuckGo answers with a bot challenge we stop knocking on that door for a while,
+  // otherwise every search digs the IP hole deeper.
+  private ddgCooldownUntil = 0;
 
   constructor() {
     this.rateLimiter = new RateLimiter(10); // 10 requests per minute
@@ -32,12 +35,46 @@ export class SearchEngine {
         
         console.log(`[SearchEngine] Quality checking: ${enableQualityCheck}, threshold: ${qualityThreshold}, multi-engine: ${forceMultiEngine}, debug: ${debugBrowsers}`);
 
-        // Try multiple approaches to get search results, starting with most reliable
-        const approaches = [
+        // Engine order: paid/proxied APIs first (immune to our egress IP reputation), then the
+        // free HTML engines. Engines marked `trusted` skip the relevance heuristic so we don't
+        // burn API credits re-trying elsewhere.
+        type Approach = {
+          method: (q: string, n: number, t: number) => Promise<SearchResult[]>;
+          name: string;
+          trusted?: boolean;
+          skip?: () => string | null;
+        };
+        const approaches: Approach[] = [];
+
+        if (process.env.SEARXNG_URL) {
+          approaches.push({ method: this.trySearxngSearch.bind(this), name: 'SearXNG', trusted: true });
+        }
+        if (process.env.SERPER_API_KEY) {
+          approaches.push({ method: this.trySerperSearch.bind(this), name: 'Serper', trusted: true });
+        }
+        if (process.env.BRAVE_API_KEY) {
+          approaches.push({ method: this.tryBraveApiSearch.bind(this), name: 'Brave API', trusted: true });
+        }
+        if (process.env.TAVILY_API_KEY) {
+          approaches.push({ method: this.tryTavilySearch.bind(this), name: 'Tavily', trusted: true });
+        }
+
+        // DuckDuckGo (POST + session warm-up) is the keyless engine that survives datacenter IPs
+        // best; browser Bing/Brave are last-resort because they are slow and frequently return
+        // empty or poisoned SERPs to cloud IPs.
+        approaches.push(
+          {
+            method: this.tryDuckDuckGoSearch.bind(this),
+            name: 'DuckDuckGo POST',
+            skip: () =>
+              this.ddgCooldownUntil > Date.now()
+                ? `DuckDuckGo in bot-challenge cooldown for another ${Math.ceil((this.ddgCooldownUntil - Date.now()) / 60000)} min`
+                : null,
+          },
+          { method: this.tryBrowserDuckDuckGoSearch.bind(this), name: 'DuckDuckGo Browser' },
           { method: this.tryBrowserBingSearch.bind(this), name: 'Browser Bing' },
-          { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' },
-          { method: this.tryDuckDuckGoSearch.bind(this), name: 'Axios DuckDuckGo' }
-        ];
+          { method: this.tryBrowserBraveSearch.bind(this), name: 'Browser Brave' }
+        );
         
         let bestResults: SearchResult[] = [];
         let bestEngine = 'None';
@@ -46,13 +83,23 @@ export class SearchEngine {
         for (let i = 0; i < approaches.length; i++) {
           const approach = approaches[i];
           try {
+            const skipReason = approach.skip?.();
+            if (skipReason) {
+              console.log(`[SearchEngine] Skipping ${approach.name}: ${skipReason}`);
+              continue;
+            }
             console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
             
-            // Use more aggressive timeouts for faster fallback
-            const approachTimeout = Math.min(timeout / 3, 4000); // Max 4 seconds per approach for faster fallback
+            // Allow enough time per engine (DDG needs a warm-up request + the search request)
+            const approachTimeout = Math.min(Math.max(timeout / 2, 6000), 12000); // 6-12 seconds per approach
             const results = await approach.method(sanitizedQuery, numResults, approachTimeout);
             if (results.length > 0) {
               console.log(`[SearchEngine] Found ${results.length} results with ${approach.name}`);
+
+              // Trusted (keyed / self-hosted) engines are authoritative - use their results as-is
+              if (approach.trusted) {
+                return { results, engine: approach.name };
+              }
               
               // Validate result quality to detect irrelevant results
               const qualityScore = enableQualityCheck ? this.assessResultQuality(results, sanitizedQuery) : 1.0;
@@ -71,8 +118,10 @@ export class SearchEngine {
                 return { results, engine: approach.name };
               }
               
-              // If quality is acceptable and this isn't Bing (first engine), return
-              if (qualityScore >= qualityThreshold && approach.name !== 'Browser Bing' && !forceMultiEngine) {
+              // Quality above threshold is good enough, whatever engine produced it. (Upstream
+              // excluded Bing here, which meant Bing results were re-tried against Brave and then
+              // dropped entirely - see the fall-through below.)
+              if (qualityScore >= qualityThreshold && !forceMultiEngine) {
                 console.log(`[SearchEngine] Good quality results from ${approach.name}, using as primary`);
                 return { results, engine: approach.name };
               }
@@ -98,6 +147,13 @@ export class SearchEngine {
           }
         }
         
+        // Nothing passed the gate. Upstream returned empty here, which silently threw away the
+        // usable (merely "low quality") results collected above - hand them back instead.
+        if (bestResults.length > 0) {
+          console.log(`[SearchEngine] No engine cleared the quality threshold, using best results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
+          return { results: bestResults, engine: bestEngine };
+        }
+
         console.log(`[SearchEngine] All approaches failed, returning empty results`);
         return { results: [], engine: 'None' };
       });
@@ -124,17 +180,37 @@ export class SearchEngine {
     for (let attempt = 1; attempt <= 2; attempt++) {
       let browser;
       try {
-        // Create a dedicated browser instance for Brave search only
-        const { firefox } = await import('playwright');
-        browser = await firefox.launch({
-          headless: process.env.BROWSER_HEADLESS !== 'false',
-          args: [
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-          ],
-        });
+        // Create a dedicated browser instance for Brave search only.
+        // Attempt 1 uses real Chrome (channel from BROWSER_CHANNEL) because Brave answers the
+        // Playwright headless shell with HTTP 429; attempt 2 falls back to bundled Firefox.
+        if (attempt === 1) {
+          const { chromium } = await import('playwright');
+          const chromeOptions = getChromiumLaunchOptions();
+          const braveArgs = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled', ...getExtraBrowserArgs()];
+          try {
+            browser = await chromium.launch({
+              headless: process.env.BROWSER_HEADLESS !== 'false',
+              ...chromeOptions,
+              args: braveArgs,
+            });
+          } catch (chromeLaunchError) {
+            console.error(`[SearchEngine] Chrome launch failed, falling back to bundled Chromium:`, chromeLaunchError instanceof Error ? chromeLaunchError.message : chromeLaunchError);
+            browser = await chromium.launch({
+              headless: process.env.BROWSER_HEADLESS !== 'false',
+              args: braveArgs,
+            });
+          }
+        } else {
+          const { firefox } = await import('playwright');
+          const firefoxPrefs = getFirefoxUserPrefs();
+          browser = await firefox.launch({
+            headless: process.env.BROWSER_HEADLESS !== 'false',
+            args: ['--no-sandbox', '--disable-dev-shm-usage', ...getExtraBrowserArgs()],
+            ...(firefoxPrefs ? { firefoxUserPrefs: firefoxPrefs } : {}),
+          });
+        }
         
-        console.log(`[SearchEngine] Brave search attempt ${attempt}/2 with fresh browser`);
+        console.log(`[SearchEngine] Brave search attempt ${attempt}/2 with fresh ${browser.browserType().name()} ${await browser.version()}`);
         const results = await this.tryBrowserBraveSearchInternal(browser, query, numResults, timeout);
         return results;
       } catch (error) {
@@ -167,7 +243,7 @@ export class SearchEngine {
     
     try {
       const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        userAgent: userAgentFor(browser.browserType().name(), await browser.version()),
         viewport: { width: 1366, height: 768 },
         locale: 'en-US',
         timezoneId: 'America/New_York',
@@ -185,11 +261,20 @@ export class SearchEngine {
           timeout: timeout
         });
 
-        // Wait for search results to load
+        // Wait for search results to load. Brave renders its results client-side (Svelte), so the
+        // initial HTML contains none of them - waiting on a single legacy selector made the run a
+        // coin flip. Accept any of the current/older layouts and give hydration a moment.
+        const resultSelector = 'div.snippet[data-type="web"], [data-type="web"], #results .snippet, .search-snippet-title, .snippet-description';
         try {
-          await page.waitForSelector('[data-type="web"]', { timeout: 3000 });
+          await page.waitForSelector(resultSelector, { timeout: Math.min(Math.max(timeout - 2000, 3000), 8000) });
         } catch {
           console.log(`[SearchEngine] Browser Brave results selector not found, proceeding anyway`);
+        }
+
+        try {
+          await page.waitForTimeout(400);
+        } catch {
+          /* ignore */
         }
 
         // Get the page content
@@ -199,6 +284,21 @@ export class SearchEngine {
         
         const results = this.parseBraveResults(html, numResults);
         console.log(`[SearchEngine] Browser Brave parsed ${results.length} results`);
+
+        if (results.length === 0) {
+          // Distinguish "layout changed" from "Brave refused us" - without this the only clue is a
+          // byte count, which looks identical for a challenge page and a hydrated SERP.
+          try {
+            const diagnostics = await page.evaluate(() => ({
+              title: document.title.slice(0, 80),
+              body: document.body ? document.body.innerText.replace(/\s+/g, ' ').slice(0, 200) : '(no body)',
+              snippets: document.querySelectorAll('.snippet, [data-type="web"]').length,
+            }));
+            console.log(`[SearchEngine] Brave diagnostics: ${JSON.stringify(diagnostics)}`);
+          } catch (diagError) {
+            console.log(`[SearchEngine] Brave diagnostics unavailable:`, diagError instanceof Error ? diagError.message : diagError);
+          }
+        }
         
         await context.close();
         return results;
@@ -223,18 +323,32 @@ export class SearchEngine {
       try {
         console.error(`[SearchEngine] BING: Attempt ${attempt}/2 - Launching Chromium browser...`);
         
-        // Create a dedicated browser instance for Bing search only
+        // Create a dedicated browser instance for Bing search only. Prefer the installed Google
+        // Chrome: the bundled headless shell gets poisoned SERPs from search engines.
         const { chromium } = await import('playwright');
         const startTime = Date.now();
-        browser = await chromium.launch({
-          headless: process.env.BROWSER_HEADLESS !== 'false',
-          args: [
-            '--no-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-          ],
-        });
+        const chromeOptions = getChromiumLaunchOptions();
+        const bingArgs = [
+          '--no-sandbox',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          ...getExtraBrowserArgs(),
+        ];
+        try {
+          browser = await chromium.launch({
+            headless: process.env.BROWSER_HEADLESS !== 'false',
+            ...chromeOptions,
+            args: bingArgs,
+          });
+        } catch (chromeLaunchError) {
+          if (!chromeOptions.channel && !chromeOptions.executablePath) throw chromeLaunchError;
+          console.error(`[SearchEngine] BING: real Chrome launch failed, using bundled Chromium:`, chromeLaunchError instanceof Error ? chromeLaunchError.message : chromeLaunchError);
+          browser = await chromium.launch({
+            headless: process.env.BROWSER_HEADLESS !== 'false',
+            args: bingArgs,
+          });
+        }
         
         const launchTime = Date.now() - startTime;
         console.error(`[SearchEngine] BING: Browser launched successfully in ${launchTime}ms, connected: ${browser.isConnected()}`);
@@ -289,7 +403,7 @@ export class SearchEngine {
     try {
       // Enhanced browser context with more realistic fingerprinting
       const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        userAgent: userAgentFor(browser.browserType().name(), await browser.version()),
         viewport: { width: 1366, height: 768 },
         locale: 'en-US',
         timezoneId: 'America/New_York',
@@ -499,37 +613,357 @@ export class SearchEngine {
   }
 
 
+  /**
+   * DuckDuckGo's HTML endpoints answer with an "anomaly" interstitial (HTTP 202) for requests
+   * that look automated - which is what a plain GET from a server IP looks like. Two things
+   * make it work reliably:
+   *   1. warm up a session against https://duckduckgo.com/ and replay the cookies
+   *   2. POST the query to html.duckduckgo.com/html/ (GET is walled, POST is not)
+   * GET on both HTML and lite endpoints are kept as fallbacks.
+   */
   private async tryDuckDuckGoSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
-    console.log(`[SearchEngine] Trying DuckDuckGo as fallback...`);
-    
+    console.log(`[SearchEngine] Trying DuckDuckGo (POST with session warm-up)...`);
+
+    const headers: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'DNT': '1',
+      'Upgrade-Insecure-Requests': '1',
+      'Referer': 'https://duckduckgo.com/',
+    };
+
+    // 1. Warm up: collect the cookies DuckDuckGo sets on the homepage.
+    let cookieHeader = '';
     try {
-      const response = await axios.get('https://html.duckduckgo.com/html/', {
-        params: {
-          q: query,
-        },
+      const warmup = await axios.get('https://duckduckgo.com/', {
+        headers,
+        timeout: Math.min(timeout, 5000),
+        maxRedirects: 3,
+        validateStatus: (status: number) => status < 500,
+      });
+      const cookies = warmup.headers['set-cookie'];
+      if (Array.isArray(cookies)) {
+        cookieHeader = cookies.map((c: string) => c.split(';')[0]).join('; ');
+      }
+      console.log(`[SearchEngine] DuckDuckGo warm-up status: ${warmup.status}, cookies: ${cookieHeader ? 'yes' : 'none'}`);
+    } catch (error) {
+      console.log(`[SearchEngine] DuckDuckGo warm-up failed (continuing without cookies): ${error instanceof Error ? error.message : 'unknown'}`);
+    }
+
+    const attempts: Array<{ label: string; run: () => Promise<{ status: number; data: string }> }> = [
+      {
+        label: 'POST html.duckduckgo.com/html/',
+        run: () =>
+          axios.post(
+            'https://html.duckduckgo.com/html/',
+            new URLSearchParams({ q: query, kl: 'wt-w' }).toString(),
+            {
+              headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded', ...(cookieHeader ? { Cookie: cookieHeader } : {}) },
+              timeout,
+              maxRedirects: 3,
+              validateStatus: (status: number) => status < 500,
+            }
+          ),
+      },
+      {
+        label: 'POST lite.duckduckgo.com/lite/',
+        run: () =>
+          axios.post(
+            'https://lite.duckduckgo.com/lite/',
+            new URLSearchParams({ q: query, kl: 'wt-w' }).toString(),
+            {
+              headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded', ...(cookieHeader ? { Cookie: cookieHeader } : {}) },
+              timeout,
+              maxRedirects: 3,
+              validateStatus: (status: number) => status < 500,
+            }
+          ),
+      },
+    ];
+
+    for (const attempt of attempts) {
+      try {
+        const response = await attempt.run();
+        const body: string = typeof response.data === 'string' ? response.data : String(response.data ?? '');
+        console.log(`[SearchEngine] DuckDuckGo ${attempt.label} -> status ${response.status}, ${body.length} bytes`);
+
+        // 202/403 or the anomaly/bot interstitial means we were walled - try the next attempt
+        if (response.status === 202 || response.status === 403 || response.status >= 500) {
+          console.log(`[SearchEngine] DuckDuckGo ${attempt.label} was walled (status ${response.status})`);
+          if (response.status === 202 || /challenge|select all squares|bot traffic/i.test(body)) {
+            this.ddgCooldownUntil = Date.now() + 15 * 60 * 1000;
+            console.log(`[SearchEngine] DuckDuckGo bot challenge detected - cooling down for 15 minutes`);
+            break;
+          }
+          continue;
+        }
+        if (/anomaly|bot traffic|blocked your request|unusual traffic/i.test(body)) {
+          console.log(`[SearchEngine] DuckDuckGo ${attempt.label} returned an anomaly page`);
+          this.ddgCooldownUntil = Date.now() + 15 * 60 * 1000;
+          break;
+        }
+
+        let results = this.parseDuckDuckGoResults(body, numResults);
+        if (results.length === 0) {
+          results = this.parseLiteDuckDuckGoResults(body, numResults);
+        }
+        if (results.length > 0) {
+          console.log(`[SearchEngine] DuckDuckGo parsed ${results.length} results via ${attempt.label}`);
+          return results;
+        }
+        console.log(`[SearchEngine] DuckDuckGo ${attempt.label} returned no parsable results`);
+      } catch (error) {
+        console.error(`[SearchEngine] DuckDuckGo ${attempt.label} failed:`, error instanceof Error ? error.message : error);
+      }
+    }
+
+    throw new Error('DuckDuckGo search failed');
+  }
+
+  /** Map a heterogeneous API response onto our SearchResult shape. */
+  private mapApiResults(items: any[], numResults: number, fields: { title: string; url: string; snippet: string }): SearchResult[] {
+    const timestamp = generateTimestamp();
+    return (items || [])
+      .filter((item: any) => item?.[fields.url] && item?.[fields.title])
+      .slice(0, numResults)
+      .map((item: any) => ({
+        title: String(item[fields.title]).trim(),
+        url: String(item[fields.url]).trim(),
+        description: String(item[fields.snippet] || 'No description available').trim(),
+        fullContent: '',
+        contentPreview: '',
+        wordCount: 0,
+        timestamp,
+        fetchStatus: 'success' as const,
+      }));
+  }
+
+  /** Serper.dev - Google SERP as a service. SERPER_API_KEY (free tier: 2500 queries). */
+  private async trySerperSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying Serper (Google API)...`);
+    const response = await axios.post(
+      'https://google.serper.dev/search',
+      { q: query, num: Math.min(Math.max(numResults, 5), 10) },
+      {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate',
-          'DNT': '1',
-          'Connection': 'keep-alive',
-          'Upgrade-Insecure-Requests': '1',
+          'X-API-KEY': process.env.SERPER_API_KEY as string,
+          'Content-Type': 'application/json',
+          'X-HTTP-Method-Override': 'POST',
         },
         timeout,
-        validateStatus: (status: number) => status < 400,
+        validateStatus: (status: number) => status < 500,
+      }
+    );
+
+    if (response.status !== 200) {
+      throw new Error(`Serper returned status ${response.status}: ${String(response.data?.message || response.data?.error || '').slice(0, 200)}`);
+    }
+
+    const organic = Array.isArray(response.data?.organic) ? response.data.organic : [];
+    const results = this.mapApiResults(organic, numResults, { title: 'title', url: 'link', snippet: 'snippet' });
+    console.log(`[SearchEngine] Serper parsed ${results.length} results`);
+    return results;
+  }
+
+  /** Brave Search API. BRAVE_API_KEY (free tier: 2000 queries/month, 1 req/s). */
+  private async tryBraveApiSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying Brave Search API...`);
+    const response = await axios.get('https://api.search.brave.com/res/v1/web/search', {
+      params: { q: query, count: Math.min(Math.max(numResults, 5), 20), text_decorations: false, country: 'us', search_lang: 'en' },
+      headers: {
+        'X-Subscription-Token': process.env.BRAVE_API_KEY as string,
+        Accept: 'application/json',
+      },
+      timeout,
+      validateStatus: (status: number) => status < 500,
+    });
+
+    if (response.status !== 200) {
+      throw new Error(`Brave API returned status ${response.status}: ${String(response.data?.detail || response.data?.error || '').slice(0, 200)}`);
+    }
+
+    const web = Array.isArray(response.data?.web?.results) ? response.data.web.results : [];
+    const results = this.mapApiResults(web, numResults, { title: 'title', url: 'url', snippet: 'description' });
+    console.log(`[SearchEngine] Brave API parsed ${results.length} results`);
+    return results;
+  }
+
+  /** Tavily - LLM-oriented search API. TAVILY_API_KEY (free tier: 1000 credits). */
+  private async tryTavilySearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying Tavily API...`);
+    const response = await axios.post(
+      'https://api.tavily.com/search',
+      {
+        query,
+        max_results: Math.min(Math.max(numResults, 5), 10),
+        search_depth: 'basic',
+        include_answer: false,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.TAVILY_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout,
+        validateStatus: (status: number) => status < 500,
+      }
+    );
+
+    if (response.status !== 200) {
+      throw new Error(`Tavily returned status ${response.status}: ${String(response.data?.detail || response.data?.error || '').slice(0, 200)}`);
+    }
+
+    const items = Array.isArray(response.data?.results) ? response.data.results : [];
+    const results = this.mapApiResults(items, numResults, { title: 'title', url: 'url', snippet: 'content' });
+    console.log(`[SearchEngine] Tavily parsed ${results.length} results`);
+    return results;
+  }
+
+  /**
+   * Launch Chromium preferring the installed Google Chrome (BROWSER_CHANNEL). Search engines
+   * fingerprint Playwright's bundled headless shell and answer it with challenges or poisoned
+   * SERPs, while the same IP through real Chrome is served normally.
+   */
+  private async launchChromeBrowser(extraArgs: string[] = []): Promise<import('playwright').Browser> {
+    const { chromium } = await import('playwright');
+    const args = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled', ...getExtraBrowserArgs(), ...extraArgs];
+    const chromeOptions = getChromiumLaunchOptions();
+
+    if (chromeOptions.channel || chromeOptions.executablePath) {
+      try {
+        return await chromium.launch({ headless: process.env.BROWSER_HEADLESS !== 'false', ...chromeOptions, args });
+      } catch (error) {
+        console.log(`[SearchEngine] Real Chrome launch failed (${error instanceof Error ? error.message.split('\n')[0] : 'unknown'}), using bundled Chromium`);
+      }
+    }
+
+    return await chromium.launch({ headless: process.env.BROWSER_HEADLESS !== 'false', args });
+  }
+
+  /**
+   * DuckDuckGo through a browser. The HTTP endpoints answer this host with an "are you a bot?"
+   * challenge (HTTP 202 + image CAPTCHA) even for a correct POST, while the same URL in real
+   * Chrome is served normally because the JS check passes - so this engine keeps working while
+   * the axios path above is cooling down.
+   */
+  private async tryBrowserDuckDuckGoSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    console.log(`[SearchEngine] Trying DuckDuckGo in a real browser...`);
+
+    let browser;
+    try {
+      browser = await this.launchChromeBrowser();
+      const context = await browser.newContext({
+        userAgent: userAgentFor(browser.browserType().name(), browser.version()),
+        viewport: { width: 1366, height: 768 },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
       });
 
-      console.log(`[SearchEngine] DuckDuckGo got response with status: ${response.status}`);
-      
-      const results = this.parseDuckDuckGoResults(response.data, numResults);
-      console.log(`[SearchEngine] DuckDuckGo parsed ${results.length} results`);
-      
+      const page = await context.newPage();
+      const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=wt-w`;
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout });
+
+      try {
+        await page.waitForSelector('a.result__a', { timeout: Math.min(Math.max(timeout - 2000, 2000), 6000) });
+      } catch {
+        console.log(`[SearchEngine] DuckDuckGo browser results selector not found, parsing whatever loaded`);
+      }
+
+      const html = await page.content();
+      if (/Select all squares|bot traffic|anomaly/i.test(html)) {
+        throw new Error('DuckDuckGo served a bot challenge to the browser');
+      }
+
+      const results = this.parseDuckDuckGoResults(html, numResults);
+      console.log(`[SearchEngine] DuckDuckGo browser parsed ${results.length} results`);
+
+      await context.close();
       return results;
-    } catch {
-      console.error(`[SearchEngine] DuckDuckGo search failed`);
-      throw new Error('DuckDuckGo search failed');
+    } finally {
+      if (browser) {
+        try {
+          await browser.close();
+        } catch (closeError) {
+          console.log(`[SearchEngine] Error closing DuckDuckGo browser:`, closeError instanceof Error ? closeError.message : closeError);
+        }
+      }
     }
+  }
+
+  /**
+   * Optional self-hosted SearXNG support: set SEARXNG_URL=https://searx.example.com
+   * (the instance must have `json` in its `search.formats` setting).
+   */
+  private async trySearxngSearch(query: string, numResults: number, timeout: number): Promise<SearchResult[]> {
+    const base = (process.env.SEARXNG_URL || '').replace(/\/+$/, '');
+    console.log(`[SearchEngine] Trying SearXNG at ${base}...`);
+
+    const response = await axios.get(`${base}/search`, {
+      params: { q: query, format: 'json' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+      },
+      timeout,
+      validateStatus: (status: number) => status < 500,
+    });
+
+    if (response.status !== 200) {
+      throw new Error(`SearXNG returned status ${response.status} (is \`json\` enabled in settings.yml?)`);
+    }
+
+    const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    const timestamp = generateTimestamp();
+    const results: SearchResult[] = (data?.results || [])
+      .filter((r: any) => r?.url && r?.title)
+      .slice(0, numResults)
+      .map((r: any) => ({
+        title: String(r.title).trim(),
+        url: String(r.url).trim(),
+        description: String(r.content || r.snippet || 'No description available').trim(),
+        fullContent: '',
+        contentPreview: '',
+        wordCount: 0,
+        timestamp,
+        fetchStatus: 'success' as const,
+      }));
+
+    console.log(`[SearchEngine] SearXNG parsed ${results.length} results`);
+    return results;
+  }
+
+  /** Fallback parser for the "lite" DuckDuckGo layout (a plain table of links). */
+  private parseLiteDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
+    const $ = cheerio.load(html);
+    const results: SearchResult[] = [];
+    const timestamp = generateTimestamp();
+
+    $('a.result-link').each((_index, element) => {
+      if (results.length >= maxResults) return false;
+      const $element = $(element);
+      const title = $element.text().trim();
+      const url = this.cleanDuckDuckGoUrl($element.attr('href') || '');
+      const snippet = $(element).closest('tr').next('tr').find('td').text().trim();
+
+      if (title && url && this.isValidSearchUrl(url)) {
+        results.push({
+          title,
+          url,
+          description: snippet || 'No description available',
+          fullContent: '',
+          contentPreview: '',
+          wordCount: 0,
+          timestamp,
+          fetchStatus: 'success',
+        });
+      }
+    });
+
+    if (results.length) {
+      console.log(`[SearchEngine] DuckDuckGo lite parser found ${results.length} results`);
+    }
+    return results;
   }
 
   private parseSearchResults(html: string, maxResults: number): SearchResult[] {
@@ -708,10 +1142,12 @@ export class SearchEngine {
         
         // Try multiple title selectors for Brave
         const titleSelectors = [
+          '.title.search-snippet-title', // Brave 2025+ layout (title is a div inside the anchor)
+          '.search-snippet-title',
+          '.snippet-title',
           '.title a',              // Brave specific
           'h2 a',                  // Common format  
           '.result-title a',       // Alternative format
-          'a[href*="://"]',        // Any external link
           '.snippet-title a'       // Snippet title
         ];
         
@@ -727,6 +1163,16 @@ export class SearchEngine {
             if (title && url && url.startsWith('http')) {
               break;
             }
+            if (title) break; // title text found; the URL is resolved from the anchor below
+          }
+        }
+
+        // In the current layout the title element carries no href: the result anchor wraps it,
+        // so take the first outbound anchor of the snippet (favicon/site-name links come later).
+        if (title && (!url || !url.startsWith('http'))) {
+          const anchorHref = $element.find('a[href^="http"]').first().attr('href') || '';
+          if (anchorHref) {
+            url = anchorHref;
           }
         }
         
@@ -742,9 +1188,9 @@ export class SearchEngine {
         
         // Try multiple snippet selectors for Brave
         const snippetSelectors = [
-          '.snippet-content',      // Brave specific
-          '.snippet',              // Generic
+          '.snippet-description',  // Brave 2025+ layout
           '.description',          // Alternative
+          '.snippet-content',      // Brave specific
           'p'                      // Fallback paragraph
         ];
         
@@ -755,6 +1201,21 @@ export class SearchEngine {
             snippet = $snippetElement.text().trim();
             break;
           }
+        }
+
+        // Current Brave markup puts the description in a class-less leaf node, so no selector
+        // matches it: take the longest text node that is neither the title nor the site/breadcrumb
+        // line.
+        if (!snippet) {
+          $element.find('div, p, span').each((_i, node) => {
+            const $node = $(node);
+            if ($node.children().length > 0) return;
+            const text = $node.text().trim();
+            if (text.length < 40 || text === title || text.startsWith(url)) return;
+            // Brave renders the site path as "site › home › blog › ..." - that is not a snippet
+            if (/[»›]/.test(text)) return;
+            if (text.length > snippet.length) snippet = text;
+          });
         }
         
         if (title && url && this.isValidSearchUrl(url)) {
@@ -980,6 +1441,28 @@ export class SearchEngine {
   }
 
   private cleanBingUrl(url: string): string {
+    // Bing wraps organic links in https://www.bing.com/ck/a?!...&u=a1<base64url>&ntb=1 .
+    // Leaving those in place means we fetch through Bing's redirector (slower, extra failure
+    // mode, and the caller never sees the real URL), so decode the target.
+    if (/bing\.com\/ck\/a\b/i.test(url)) {
+      try {
+        const encoded = new URL(url).searchParams.get('u');
+        if (encoded) {
+          // Bing prefixes the base64 payload with a two-char marker ("a1")
+          const payload = encoded.startsWith('a1') ? encoded.slice(2) : encoded;
+          const decoded = Buffer.from(payload, 'base64url').toString('utf8');
+          if (/^https?:\/\//i.test(decoded)) {
+            console.log(`[SearchEngine] Decoded Bing redirect URL: ${decoded}`);
+            return decoded;
+          }
+        }
+      } catch (error) {
+        console.log(`[SearchEngine] Failed to decode Bing redirect URL (${error instanceof Error ? error.message : 'unknown'}): ${url}`);
+      }
+      // Un-decodable redirector link: keep it, the redirect still works
+      return url;
+    }
+
     // Bing URLs are usually direct, but check for any redirect patterns
     if (url.startsWith('//')) {
       return 'https:' + url;

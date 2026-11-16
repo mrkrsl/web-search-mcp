@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
-import { isPdfUrl } from './utils.js';
+import { isPdfUrl, getNoResultsGuidance } from './utils.js';
 
 class WebSearchMCPServer {
   private server: McpServer;
@@ -103,6 +103,10 @@ class WebSearchMCPServer {
           // Add status line if available
           if (result.status) {
             responseText += `**Status:** ${result.status}\n\n`;
+          }
+
+          if (result.total_results === 0) {
+            responseText += `${getNoResultsGuidance()}\n\n`;
           }
           
           const maxLength = validatedArgs.maxContentLength;
@@ -207,6 +211,10 @@ class WebSearchMCPServer {
             
             // Format the results as text
             let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
+
+            if (summaryResults.length === 0) {
+              responseText += `${getNoResultsGuidance()}\n\n`;
+            }
             
             summaryResults.forEach((summary, i) => {
               responseText += `**${i + 1}. ${summary.title}**\n`;
@@ -295,6 +303,22 @@ class WebSearchMCPServer {
           const wordCount = content.split(/\s+/).filter(word => word.length > 0).length;
 
           console.log(`[MCP] Single page content extraction completed, extracted ${content.length} characters`);
+
+          if (!content.trim()) {
+            console.error(`[MCP] Extraction produced no text for ${obj.url}`);
+            return {
+              isError: true,
+              content: [
+                {
+                  type: 'text' as const,
+                  text:
+                    `Could not extract any text from ${obj.url}. The page is either JavaScript-only, ` +
+                    `served a bot challenge, or returned an empty body. Try a different URL (or the ` +
+                    `AMP/canonical/print variant) instead of treating this as an empty page.`,
+                },
+              ],
+            };
+          }
 
           // Format the result as text
           let responseText = `**Page Content from: ${obj.url}**\n\n`;

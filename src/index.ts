@@ -507,37 +507,49 @@ class WebSearchMCPServer {
     });
 
     // Graceful shutdown - close browsers when process exits
-    process.on('SIGINT', async () => {
-      console.log('Shutting down gracefully...');
-      try {
-        await Promise.all([
-          this.contentExtractor.closeAll(),
-          this.searchEngine.closeAll()
-        ]);
-      } catch (error) {
-        console.error('Error during graceful shutdown:', error);
-      }
-      process.exit(0);
-    });
+    process.on('SIGINT', () => void this.shutdown('SIGINT'));
+    process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
+    process.on('SIGHUP', () => void this.shutdown('SIGHUP'));
+  }
 
-    process.on('SIGTERM', async () => {
-      console.log('Shutting down gracefully...');
-      try {
-        await Promise.all([
-          this.contentExtractor.closeAll(),
-          this.searchEngine.closeAll()
-        ]);
-      } catch (error) {
-        console.error('Error during graceful shutdown:', error);
-      }
+  private shuttingDown = false;
+
+  /**
+   * Close every browser and exit. Without this the Playwright Chromium processes keep running
+   * under a detached server: an MCP client that dies without signalling (crash, `process.exit()`
+   * in a script) left 2 orphaned servers and ~2 GiB of headless Chrome behind on this machine.
+   */
+  private async shutdown(reason: string): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    console.log(`Shutting down gracefully (${reason})...`);
+
+    const deadline = setTimeout(() => {
+      console.error(`Shutdown deadline reached while closing browsers for ${reason}, exiting anyway`);
       process.exit(0);
-    });
+    }, 5000);
+    // do not keep the event loop alive just for the deadline
+    deadline.unref?.();
+
+    try {
+      await Promise.all([this.contentExtractor.closeAll(), this.searchEngine.closeAll()]);
+    } catch (error) {
+      console.error('Error during graceful shutdown:', error);
+    } finally {
+      clearTimeout(deadline);
+      process.exit(0);
+    }
   }
 
   async run(): Promise<void> {
     console.log('Setting up MCP server...');
     const transport = new StdioServerTransport();
-    
+
+    // The parent's pipe going away is the only signal we get when it dies without signalling
+    // (crash, `process.exit()` in a script): stdin hits EOF and nothing else notices.
+    process.stdin.on('end', () => void this.shutdown('stdin closed by client'));
+    process.stdin.on('close', () => void this.shutdown('stdin closed by client'));
+
     console.log('Connecting to transport...');
     await this.server.connect(transport);
     console.log('Web Search MCP Server started');

@@ -41,7 +41,8 @@ export class EnhancedContentExtractor {
       console.log(`[EnhancedContentExtractor] Successfully extracted with axios: ${content.length} chars`);
       return content;
     } catch (error) {
-      console.log(`[EnhancedContentExtractor] Axios failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      const axiosReason = this.describeError(error);
+      console.log(`[EnhancedContentExtractor] Axios failed: ${axiosReason}`);
       
       // Check if this looks like a case where browser would help
       if (this.shouldUseBrowser(error, url)) {
@@ -51,13 +52,88 @@ export class EnhancedContentExtractor {
           console.log(`[EnhancedContentExtractor] Successfully extracted with browser: ${content.length} chars`);
           return content;
         } catch (browserError) {
+          const browserReason = this.describeError(browserError);
           console.error(`[EnhancedContentExtractor] Browser extraction also failed:`, browserError);
-          throw new Error(`Both axios and browser extraction failed for ${url}`);
+
+          // The caller only ever sees this string, and the previous "Both axios and browser
+          // extraction failed for <url>" told it nothing: a bot-protection wall, a DNS failure and
+          // a page with no text all looked identical.
+          const blocked = `${axiosReason} ${browserReason}`.toLowerCase().includes('interstitial');
+          const hint = blocked
+            ? ' The site is serving a bot-protection page instead of the article - try a different source.'
+            : '';
+
+          throw new Error(`Could not extract content from ${url}: HTTP said "${axiosReason}"; browser said "${browserReason}".${hint}`);
         }
       } else {
-        throw error;
+        // No browser fallback was warranted (404, DNS failure, TLS error, ...). Keep the reason -
+        // categorizeError() keys off it - but name the URL so the caller is not left guessing.
+        throw new Error(`Could not fetch ${url}: ${axiosReason}`);
       }
     }
+  }
+
+  /** Stable marker used both when rejecting low quality content and when deciding on a fallback. */
+  private static readonly LOW_QUALITY_PREFIX = 'low-quality content';
+
+  /**
+   * One-line, length-bounded description of a failure - axios errors can carry whole response
+   * bodies, which must not end up in an MCP tool response.
+   */
+  private describeError(error: unknown): string {
+    let reason: string;
+
+    if (axios.isAxiosError(error)) {
+      const status = error.response?.status;
+      if (status) {
+        reason = `HTTP ${status} ${error.response?.statusText ?? ''}`.trim();
+      } else {
+        // Network-level failures carry a code only. Spelling it out also lets index.ts
+        // categorise them - before this, "getaddrinfo ENOTFOUND host" matched nothing and came
+        // back as "Other error".
+        reason = this.describeNetworkCode(error.code, error.message);
+      }
+    } else {
+      reason = error instanceof Error ? error.message : String(error);
+    }
+
+    const clean = reason.replace(/\s+/g, ' ').replace(/^error:\s*/i, '').trim();
+    return clean.length > 180 ? `${clean.slice(0, 177)}...` : (clean || 'unknown error');
+  }
+
+  /** Translate axios network error codes into phrases that name the actual problem. */
+  private describeNetworkCode(code: string | undefined, message: string): string {
+    switch (code) {
+      case 'ENOTFOUND':
+      case 'EAI_AGAIN':
+        return `DNS lookup failed (${code})`;
+      case 'ECONNREFUSED':
+        return 'connection refused (ECONNREFUSED)';
+      case 'ECONNRESET':
+      case 'EPIPE':
+        return 'connection reset by peer';
+      case 'ETIMEDOUT':
+      case 'ECONNABORTED':
+        return `timed out (${code})`;
+      case 'ERR_NETWORK':
+        return 'network error';
+      default:
+        // TLS codes vary a lot (CERT_HAS_EXPIRED, ERR_TLS_CERT_ALTNAME_INVALID,
+        // DEPTH_ZERO_SELF_SIGNED_CERT, UNABLE_TO_VERIFY_LEAF_SIGNATURE...). Name them as TLS so the
+        // failure is not classified by an accidental substring of the hostname (e.g. badssl.com).
+        if (code && /CERT|TLS|SSL|SELF_SIGNED|UNKNOWN_CA/i.test(code)) {
+          return `TLS certificate error (${code})`;
+        }
+        return code || message || 'request failed';
+    }
+  }
+
+  /** Why the extracted text was rejected, phrased so the caller can act on it. */
+  private describeRejection(content: string): string {
+    if (this.isBlockPage(content)) {
+      return 'bot-protection interstitial (no article content)';
+    }
+    return `no usable article text (${content.trim().length} characters extracted)`;
   }
 
   private async extractWithAxios(options: ContentExtractionOptions): Promise<string> {
@@ -80,7 +156,7 @@ export class EnhancedContentExtractor {
     
     // Check if we got a meaningful response
     if (this.isLowQualityContent(content)) {
-      throw new Error('Low quality content detected - likely bot detection');
+      throw new Error(`${EnhancedContentExtractor.LOW_QUALITY_PREFIX}: ${this.describeRejection(content)}`);
     }
     
     return content;
@@ -295,7 +371,7 @@ export class EnhancedContentExtractor {
       error.message?.includes('timeout'),
       error.message?.includes('Access denied'),
       error.message?.includes('Forbidden'),
-      error.message?.includes('Low quality content detected'),
+      error.message?.includes(EnhancedContentExtractor.LOW_QUALITY_PREFIX),
       
       // Response content suggesting bot detection
       error.response?.data?.includes('Please enable JavaScript'),

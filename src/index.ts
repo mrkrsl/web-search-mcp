@@ -464,7 +464,12 @@ class WebSearchMCPServer {
 
   private categorizeError(errorMessage: string): string {
     const lowerError = errorMessage.toLowerCase();
-    
+
+    // Checked first: a bot-protection page usually also reports HTTP 403/429, and "Bot detection"
+    // is the actionable category (retry differently), whereas "Access denied" suggests permissions.
+    if (lowerError.includes('interstitial') || lowerError.includes('bot protection') || lowerError.includes('bot-protection') || lowerError.includes('captcha') || lowerError.includes('unusual traffic')) {
+      return 'Bot detection';
+    }
     if (lowerError.includes('timeout') || lowerError.includes('timed out')) {
       return 'Timeout';
     }
@@ -473,9 +478,6 @@ class WebSearchMCPServer {
     }
     if (lowerError.includes('404') || lowerError.includes('not found')) {
       return 'Not found';
-    }
-    if (lowerError.includes('bot') || lowerError.includes('captcha') || lowerError.includes('unusual traffic')) {
-      return 'Bot detection';
     }
     if (lowerError.includes('too large') || lowerError.includes('content length') || lowerError.includes('maxcontentlength')) {
       return 'Content too long';

@@ -1,5 +1,8 @@
 import {
+  closeSync,
   existsSync,
+  openSync,
+  readSync,
 } from 'node:fs';
 
 /**
@@ -112,6 +115,51 @@ export function getExtraBrowserArgs(): string[] {
   }
 
   return args;
+}
+
+/**
+ * Firefox binary override. NOTE: unlike Chromium (driven over CDP, so any installed Chrome works),
+ * Playwright drives Firefox through a `-juggler-pipe` flag that only exists in Firefox builds
+ * patched for Playwright. Pointing this at a distribution Firefox therefore fails to launch - the
+ * callers catch that and retry with the bundled build, so a wrong value degrades instead of
+ * breaking search. It is meant for matching custom builds, e.g. the fingerprint-patched Firefox
+ * shipped by `invisible_playwright`.
+ */
+export function getFirefoxLaunchOptions(): { executablePath?: string } {
+  const path = (process.env.FIREFOX_EXECUTABLE_PATH || '').trim();
+  if (!path) return {};
+
+  if (!existsSync(path)) {
+    console.log(`[web-search-mcp] FIREFOX_EXECUTABLE_PATH=${path} does not exist, using Playwright's bundled Firefox`);
+    return {};
+  }
+
+  if (isShellScript(path)) {
+    // Refuse before launching. A distro launcher script (Debian/Ubuntu: /usr/bin/firefox execs
+    // firefox-esr) starts a *real* Firefox that Playwright can never attach to, and that process
+    // then survives until the launch timeout - which looked like a 20+ second stall followed by an
+    // unusable browser object.
+    console.log(`[web-search-mcp] FIREFOX_EXECUTABLE_PATH=${path} is a wrapper script, not a Playwright-patched Firefox binary; ignoring it and using the bundled Firefox. Playwright drives Firefox through a -juggler-pipe flag that only patched builds implement.`);
+    return {};
+  }
+
+  return { executablePath: path };
+}
+
+/** Cheap `#!` sniff: distro Firefox launchers are shell wrappers Playwright cannot drive. */
+function isShellScript(path: string): boolean {
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const buf = Buffer.alloc(2);
+      if (readSync(fd, buf, 0, 2, 0) !== 2) return false;
+      return buf.toString('utf8') === '#!';
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
 }
 
 /**

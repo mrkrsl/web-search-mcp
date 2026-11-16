@@ -1,7 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
-import { generateTimestamp, sanitizeQuery, getChromiumLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs, userAgentFor } from './utils.js';
+import { generateTimestamp, sanitizeQuery, getChromiumLaunchOptions, getFirefoxLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs, userAgentFor } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
 
@@ -203,11 +203,21 @@ export class SearchEngine {
         } else {
           const { firefox } = await import('playwright');
           const firefoxPrefs = getFirefoxUserPrefs();
-          browser = await firefox.launch({
+          const firefoxOverride = getFirefoxLaunchOptions();
+          const firefoxOptions = {
             headless: process.env.BROWSER_HEADLESS !== 'false',
-            args: ['--no-sandbox', '--disable-dev-shm-usage', ...getExtraBrowserArgs()],
+            // Chromium switches leave Firefox unable to open pages; pass only what the operator set
+            args: getExtraBrowserArgs(),
             ...(firefoxPrefs ? { firefoxUserPrefs: firefoxPrefs } : {}),
-          });
+          };
+          try {
+            // fail fast on a bad custom path (Playwright's default launch timeout is 180 s)
+            browser = await firefox.launch({ ...firefoxOptions, ...firefoxOverride, ...(firefoxOverride.executablePath ? { timeout: 20000 } : {}) });
+          } catch (customError) {
+            if (!firefoxOverride.executablePath) throw customError;
+            console.log(`[SearchEngine] FIREFOX_EXECUTABLE_PATH=${firefoxOverride.executablePath} could not be launched (${customError instanceof Error ? customError.message.split('\n')[0] : 'unknown'}); Playwright only drives juggler-patched Firefox builds, retrying with the bundled one`);
+            browser = await firefox.launch(firefoxOptions);
+          }
         }
         
         console.log(`[SearchEngine] Brave search attempt ${attempt}/2 with fresh ${browser.browserType().name()} ${await browser.version()}`);

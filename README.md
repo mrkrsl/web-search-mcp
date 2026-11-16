@@ -159,6 +159,10 @@ The server supports several environment variables for configuration:
   `axios POST html.duckduckgo.com -> HTTP 202 challenge`, `real Chrome GET same URL -> 10 results`.
   User agents are now derived from the launched browser version instead of a hardcoded Chrome/121
   string, because a UA that contradicts the engine is itself a detection signal.
+- **`FIREFOX_EXECUTABLE_PATH`**: absolute path to a Firefox binary to use instead of Playwright's
+  bundled build (browser pool and the Brave search retry). A missing path is reported and ignored,
+  so a stale value cannot break search. Useful for distributions' Firefox and for fingerprint-patched
+  builds such as `invisible_playwright`.
 - **`BROWSER_EXTRA_ARGS`**: space separated extra switches appended to every browser launch
   (content-extraction pool and all browser search engines)
 - **`FIREFOX_DISABLE_DOH`**: set to `true` to launch Firefox with `network.trr.mode=5` and

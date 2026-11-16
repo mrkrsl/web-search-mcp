@@ -1,5 +1,5 @@
 import { chromium, firefox, webkit, Browser } from 'playwright';
-import { getChromiumLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs } from './utils.js';
+import { getChromiumLaunchOptions, getFirefoxLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs } from './utils.js';
 
 export class BrowserPool {
   private browsers: Map<string, Browser> = new Map();
@@ -56,24 +56,35 @@ export class BrowserPool {
     // Launch new browser
     console.log(`[BrowserPool] Launching new ${browserType} browser`);
     
+    // These switches are Chromium-specific. Firefox accepts them at launch and then starts in a
+    // broken state where the browser object looks connected but newPage()/navigation hang until
+    // timeout - measured here as 235 s vs 2 s with the flags removed. So each browser type gets
+    // only the arguments that mean something for it, plus whatever the operator asked for.
+    const chromiumArgs = [
+      '--no-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-default-apps',
+      '--disable-extensions',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-features=TranslateUI',
+      '--disable-ipc-flooding-protection',
+      ...getExtraBrowserArgs(),
+    ];
+
     const launchOptions = {
       headless: this.headless,
-      args: [
-        '--no-sandbox',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-default-apps',
-        '--disable-extensions',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        ...getExtraBrowserArgs(),
-      ],
+      args: chromiumArgs,
+    };
+
+    const nonChromiumOptions = {
+      headless: this.headless,
+      args: getExtraBrowserArgs(),
     };
 
     let browser: Browser;
@@ -91,11 +102,24 @@ export class BrowserPool {
           break;
         case 'firefox': {
           const firefoxPrefs = getFirefoxUserPrefs();
-          browser = await firefox.launch({ ...launchOptions, ...(firefoxPrefs ? { firefoxUserPrefs: firefoxPrefs } : {}) });
+          const firefoxOverride = getFirefoxLaunchOptions();
+          const firefoxOptions = {
+            ...nonChromiumOptions,
+            ...(firefoxPrefs ? { firefoxUserPrefs: firefoxPrefs } : {}),
+          };
+          try {
+            // A wrong custom path must fail fast: Playwright's default launch timeout is 180 s,
+            // which would stall the whole search on a bad environment variable.
+            browser = await firefox.launch({ ...firefoxOptions, ...firefoxOverride, ...(firefoxOverride.executablePath ? { timeout: 20000 } : {}) });
+          } catch (customError) {
+            if (!firefoxOverride.executablePath) throw customError;
+            console.log(`[BrowserPool] FIREFOX_EXECUTABLE_PATH=${firefoxOverride.executablePath} could not be launched (${customError instanceof Error ? customError.message.split('\n')[0] : 'unknown'}); Playwright only drives Firefox builds patched with its juggler pipe. Retrying with the bundled Firefox.`);
+            browser = await firefox.launch(firefoxOptions);
+          }
           break;
         }
         case 'webkit':
-          browser = await webkit.launch(launchOptions);
+          browser = await webkit.launch(nonChromiumOptions);
           break;
         default:
           browser = await chromium.launch(launchOptions);

@@ -1,4 +1,5 @@
 import { chromium, firefox, webkit, Browser } from 'playwright';
+import { getChromiumLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs } from './utils.js';
 
 export class BrowserPool {
   private browsers: Map<string, Browser> = new Map();
@@ -71,6 +72,7 @@ export class BrowserPool {
         '--disable-renderer-backgrounding',
         '--disable-features=TranslateUI',
         '--disable-ipc-flooding-protection',
+        ...getExtraBrowserArgs(),
       ],
     };
 
@@ -78,11 +80,20 @@ export class BrowserPool {
     try {
       switch (browserType) {
         case 'chromium':
-          browser = await chromium.launch(launchOptions);
+          try {
+            // Prefer the installed Google Chrome (see getChromiumLaunchOptions): sites that
+            // fingerprint the Playwright headless shell refuse it while accepting real Chrome.
+            browser = await chromium.launch({ ...getChromiumLaunchOptions(), ...launchOptions });
+          } catch (chromeError) {
+            console.log(`[BrowserPool] Real Chrome unavailable (${chromeError instanceof Error ? chromeError.message.split('\n')[0] : 'unknown'}), using bundled Chromium`);
+            browser = await chromium.launch(launchOptions);
+          }
           break;
-        case 'firefox':
-          browser = await firefox.launch(launchOptions);
+        case 'firefox': {
+          const firefoxPrefs = getFirefoxUserPrefs();
+          browser = await firefox.launch({ ...launchOptions, ...(firefoxPrefs ? { firefoxUserPrefs: firefoxPrefs } : {}) });
           break;
+        }
         case 'webkit':
           browser = await webkit.launch(launchOptions);
           break;

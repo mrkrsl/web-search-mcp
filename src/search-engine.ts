@@ -1,9 +1,10 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { SearchOptions, SearchResult, SearchResultWithMetadata } from './types.js';
-import { generateTimestamp, sanitizeQuery, getChromiumLaunchOptions, getFirefoxLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs, userAgentFor } from './utils.js';
+import { generateTimestamp, sanitizeQuery, getChromiumLaunchOptions, getFirefoxLaunchOptions, getExtraBrowserArgs, getFirefoxUserPrefs, userAgentFor, delay, envInt, envTtlMinutes, normalizeForDedupe } from './utils.js';
 import { RateLimiter } from './rate-limiter.js';
 import { BrowserPool } from './browser-pool.js';
+import { TtlCache, SingleFlight } from './cache.js';
 
 export class SearchEngine {
   private readonly rateLimiter: RateLimiter;
@@ -11,10 +12,56 @@ export class SearchEngine {
   // When DuckDuckGo answers with a bot challenge we stop knocking on that door for a while,
   // otherwise every search digs the IP hole deeper.
   private ddgCooldownUntil = 0;
+  // Repeat queries are served from memory: re-running the engine chain for a query the caller
+  // just asked is pure IP reputation burn.
+  private readonly searchCache: TtlCache<SearchResultWithMetadata>;
+  private readonly inflight = new SingleFlight();
+  private readonly lastEngineUse = new Map<string, number>();
 
   constructor() {
     this.rateLimiter = new RateLimiter(10); // 10 requests per minute
     this.browserPool = new BrowserPool();
+    this.searchCache = new TtlCache<SearchResultWithMetadata>(
+      envInt('CACHE_MAX_ENTRIES', 200),
+      envTtlMinutes('SEARCH_CACHE_TTL_MINUTES', 15),
+    );
+    console.log(`[SearchEngine] Search cache: ${this.searchCache.enabled ? `${this.searchCache.summary()} (SEARCH_CACHE_TTL_MINUTES)` : 'disabled'}`);
+  }
+
+  /**
+   * Free engines answer an identical query with an identical SERP for as long as the cache lives,
+   * and repeated hits on the same engine within a second are what draws a 429 from datacenter IPs.
+   */
+  private async throttleEngine(name: string): Promise<void> {
+    const minIntervalMs = envInt('ENGINE_MIN_INTERVAL_MS', 1000);
+    if (minIntervalMs <= 0) return;
+
+    const last = this.lastEngineUse.get(name) ?? 0;
+    const waitMs = last + minIntervalMs - Date.now();
+    if (waitMs > 0) {
+      console.log(`[SearchEngine] Throttling ${name}: ${waitMs}ms since its previous request (ENGINE_MIN_INTERVAL_MS=${minIntervalMs})`);
+      await delay(waitMs);
+    }
+    this.lastEngineUse.set(name, Date.now());
+  }
+
+  /**
+   * Drop results whose URLs differ only by scheme, `www.`, a trailing slash, a fragment or an
+   * ad parameter. The first (highest ranked) variant wins.
+   */
+  private dedupeResults(results: SearchResult[]): SearchResult[] {
+    const seen = new Set<string>();
+    const kept = results.filter((result) => {
+      const key = normalizeForDedupe(result.url);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    if (kept.length !== results.length) {
+      console.log(`[SearchEngine] De-duplicated ${results.length - kept.length} duplicate result URL(s), ${kept.length} remain`);
+    }
+    return kept;
   }
 
   async search(options: SearchOptions): Promise<SearchResultWithMetadata> {
@@ -24,7 +71,38 @@ export class SearchEngine {
     console.log(`[SearchEngine] Starting search for query: "${sanitizedQuery}"`);
     
     try {
-      return await this.rateLimiter.execute(async () => {
+      const cacheKey = `${sanitizedQuery.toLowerCase()}|${numResults}`;
+      const cached = this.searchCache.get(cacheKey);
+      if (cached) {
+        console.log(`[SearchEngine] Cache hit for "${sanitizedQuery}" (${this.searchCache.summary()})`);
+        return { ...cached, engine: `${cached.engine} (cached)` };
+      }
+
+      // Concurrent identical queries share one upstream request.
+      return await this.inflight.run(cacheKey, async () => {
+        const answer = await this.runEngineChain(sanitizedQuery, numResults, timeout);
+        const results = this.dedupeResults(answer.results);
+        const out = { ...answer, results };
+        // An empty SERP is usually a wall rather than a real "no results", so it is remembered for
+        // only a moment: long enough to stop a retry storm, short enough not to hide a recovery.
+        this.searchCache.set(cacheKey, out, results.length ? undefined : envInt('EMPTY_RESULT_CACHE_TTL_SECONDS', 120) * 1000);
+        return out;
+      });
+    } catch (error) {
+      console.error('[SearchEngine] Search error:', error);
+      if (axios.isAxiosError(error)) {
+        console.error('[SearchEngine] Axios error details:', {
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          data: error.response?.data?.substring(0, 500),
+        });
+      }
+      throw new Error(`Failed to perform search: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  private async runEngineChain(sanitizedQuery: string, numResults: number, timeout: number): Promise<SearchResultWithMetadata> {
+    return await this.rateLimiter.execute(async () => {
         console.log(`[SearchEngine] Starting search with multiple engines...`);
         
         // Configuration from environment variables
@@ -89,6 +167,7 @@ export class SearchEngine {
               continue;
             }
             console.log(`[SearchEngine] Attempting ${approach.name} (${i + 1}/${approaches.length})...`);
+            if (!approach.trusted) await this.throttleEngine(approach.name);
             
             // Allow enough time per engine (DDG needs a warm-up request + the search request)
             const approachTimeout = Math.min(Math.max(timeout / 2, 6000), 12000); // 6-12 seconds per approach
@@ -157,17 +236,6 @@ export class SearchEngine {
         console.log(`[SearchEngine] All approaches failed, returning empty results`);
         return { results: [], engine: 'None' };
       });
-    } catch (error) {
-      console.error('[SearchEngine] Search error:', error);
-      if (axios.isAxiosError(error)) {
-        console.error('[SearchEngine] Axios error details:', {
-          status: error.response?.status,
-          statusText: error.response?.statusText,
-          data: error.response?.data?.substring(0, 500),
-        });
-      }
-      throw new Error(`Failed to perform search: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
   }
 
 

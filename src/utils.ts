@@ -205,6 +205,73 @@ export function isPdfUrl(url: string): boolean {
 const SEARCH_PROVIDERS = ['SEARXNG_URL', 'SERPER_API_KEY', 'BRAVE_API_KEY', 'TAVILY_API_KEY'];
 
 /**
+ * Read a non-negative integer env var with a fallback, warning instead of producing NaN.
+ */
+export function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn(`[web-search-mcp] Invalid ${name}="${raw}", using ${fallback}`);
+    return fallback;
+  }
+  return Math.round(parsed);
+}
+
+/**
+ * Cache lifetime in milliseconds, configured in minutes. `0` turns that cache off, and
+ * `NO_CACHE=true` turns them all off - useful while debugging an extraction that keeps returning
+ * a page the site has already changed.
+ */
+export function envTtlMinutes(name: string, defaultMinutes: number): number {
+  if (/^(1|true|yes)$/i.test(process.env.NO_CACHE || '')) return 0;
+
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return defaultMinutes * 60_000;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn(`[web-search-mcp] Invalid ${name}="${raw}", using ${defaultMinutes} minutes`);
+    return defaultMinutes * 60_000;
+  }
+  return Math.round(parsed * 60_000);
+}
+
+/** Query parameters that never identify a page - they only tell the site who sent the visitor. */
+const TRACKING_PARAM = /^(utm_|ga_|gid|gcl|dclid|fbclid|msclkid|igshid|twclid|yclid|pk_|piwik|matomo|mtm_|hsa_|mc_eid|vero|ref|ref_src|src|source|campaign|cmpid|igsid|s_kwcid|ef_id|trk|trkCampaign|mkt_tok)/i;
+
+/**
+ * Canonical form of a URL for de-duplication, not for fetching: scheme folded to https, `www.`
+ * removed, fragment and tracking parameters dropped, trailing slash normalized.
+ *
+ * SERPs hand back the same page under several of these variants, and each variant used to cost a
+ * separate page fetch inside one `full-web-search`. Returns the input unchanged when it cannot be
+ * parsed, so a weird URL simply stops being a de-duplication candidate instead of collapsing into
+ * another URL.
+ */
+export function normalizeForDedupe(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return url.trim();
+
+    parsed.hash = '';
+    parsed.protocol = 'https:';
+    parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (TRACKING_PARAM.test(key)) parsed.searchParams.delete(key);
+    }
+    parsed.searchParams.sort();
+
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.toString();
+  } catch {
+    return url.trim();
+  }
+}
+
+/**
  * Explanation appended when every engine came back empty, so the caller learns what to do
  * instead of retrying the same query into another bot wall.
  */
@@ -221,6 +288,7 @@ export function getNoResultsGuidance(): string {
     `For reliable results add one of these to the "env" block of the websearch server in mcp.json: ${missing.join(' | ')}.`,
     'Free tiers: Brave Search API 2 000 req/month, Serper.dev 2 500 credits, Tavily 1 000 credits, SearXNG self-hosted (no key, needs `json` in search.formats).',
     'DuckDuckGo challenges are cached per IP for a while - wait ~15 minutes before retrying the free path.',
+    'This server also caches SERPs (SEARCH_CACHE_TTL_MINUTES) so an empty answer is repeated within that window; set NO_CACHE=true to force a fresh engine walk.',
   ];
 
   return lines.join('\n');

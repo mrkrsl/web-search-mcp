@@ -2,14 +2,24 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult } from './types.js';
-import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl, userAgentFor } from './utils.js';
+import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl, userAgentFor, normalizeForDedupe, envInt, envTtlMinutes } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
+import { TtlCache, SingleFlight } from './cache.js';
 
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
   private readonly maxContentLength: number;
   private browserPool: BrowserPool;
   private fallbackThreshold: number;
+  /**
+   * Extracted pages, keyed by the de-duplicated URL. `full-web-search` and a follow-up
+   * `get-single-web-page-content` on the same article used to fetch it twice, and asking a
+   * bot-protected site the same question twice in a row is how a soft block becomes a hard one.
+   */
+  private readonly pageCache: TtlCache<string>;
+  /** Recently failed URLs, kept briefly so a retry storm does not hammer a walled host. */
+  private readonly failureCache: TtlCache<string>;
+  private readonly inflight = new SingleFlight();
 
   constructor() {
     this.defaultTimeout = parseInt(process.env.DEFAULT_TIMEOUT || '6000', 10);
@@ -26,11 +36,75 @@ export class EnhancedContentExtractor {
     
     this.browserPool = new BrowserPool();
     this.fallbackThreshold = parseInt(process.env.BROWSER_FALLBACK_THRESHOLD || '3', 10);
-    
+    const maxEntries = envInt('CACHE_MAX_ENTRIES', 200);
+    const pageTtlMs = envTtlMinutes('CONTENT_CACHE_TTL_MINUTES', 30);
+    this.pageCache = new TtlCache<string>(maxEntries, pageTtlMs);
+    this.failureCache = new TtlCache<string>(maxEntries, envTtlMinutes('FAILED_EXTRACTION_CACHE_TTL_MINUTES', 5));
+
     console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}`);
+    console.log(`[EnhancedContentExtractor] Page cache: ${this.pageCache.enabled ? `${Math.round(pageTtlMs / 60000)} min TTL, ${maxEntries} entries max` : 'disabled'}`);
   }
 
+  /** One line for the tool status so the caller can tell a refetch from a cache hit. */
+  getCacheSummary(): string {
+    if (!this.pageCache.enabled) return 'page cache disabled';
+    return `page cache ${this.pageCache.summary()}, failures ${this.failureCache.summary()}`;
+  }
+
+  /** Cache key: the same article under two tracking URLs is one entry. */
+  private cacheKey(url: string): string {
+    return normalizeForDedupe(url);
+  }
+
+  private capTo(text: string, maxContentLength?: number): string {
+    return maxContentLength && maxContentLength > 0 && text.length > maxContentLength
+      ? text.substring(0, maxContentLength)
+      : text;
+  }
+
+  /**
+   * Cached wrapper around the actual extraction.
+   *
+   * The cache stores the page at the configured ceiling (MAX_CONTENT_LENGTH) and truncates per
+   * request, so one fetch serves callers asking for different lengths. A caller who explicitly
+   * asks for more than the ceiling bypasses the cache rather than getting a short copy of a page
+   * it asked in full for.
+   */
   async extractContent(options: ContentExtractionOptions): Promise<string> {
+    const { url, maxContentLength } = options;
+    const key = this.cacheKey(url);
+    const cacheable = maxContentLength === undefined || maxContentLength <= 0 || maxContentLength <= this.maxContentLength;
+
+    if (cacheable) {
+      const hit = this.pageCache.get(key);
+      if (hit !== undefined) {
+        console.log(`[EnhancedContentExtractor] Cache hit for ${url} (${hit.length} chars, ${this.pageCache.summary()})`);
+        return this.capTo(hit, maxContentLength);
+      }
+
+      const failure = this.failureCache.get(key);
+      if (failure !== undefined) {
+        // Deliberately an error again: the site refused it minutes ago and will refuse it now.
+        // The reason is preserved so index.ts still categorises it identically.
+        const left = this.failureCache.remainingFor(key);
+        console.log(`[EnhancedContentExtractor] Reusing cached failure for ${url} (${left}s left in cache)`);
+        throw new Error(`${failure} (same failure ${left}s ago; FAILED_EXTRACTION_CACHE_TTL_MINUTES controls this)`);
+      }
+    }
+
+    try {
+      const content = await this.inflight.run(key, () =>
+        this.extractUncached(cacheable ? { ...options, maxContentLength: undefined } : options),
+      );
+      if (cacheable) this.pageCache.set(key, content);
+      return this.capTo(content, maxContentLength);
+    } catch (error) {
+      if (cacheable) this.failureCache.set(key, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  private async extractUncached(options: ContentExtractionOptions): Promise<string> {
     const { url } = options;
     
     console.log(`[EnhancedContentExtractor] Starting extraction for: ${url}`);
@@ -524,69 +598,123 @@ export class EnhancedContentExtractor {
     return timezones[Math.floor(Math.random() * timezones.length)];
   }
 
-  async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
-    console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
-    
-    // Filter out PDF files first
-    const nonPdfResults = results.filter(result => !isPdfUrl(result.url));
-    const resultsToProcess = nonPdfResults.slice(0, Math.min(targetCount * 2, 10)); // Process extra to account for failures
-    
-    console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results concurrently`);
-    
-    // Process results concurrently with timeout
-    const extractionPromises = resultsToProcess.map(async (result): Promise<SearchResult> => {
-      try {
-        // Use a race condition with timeout to prevent hanging
-        const extractionPromise = this.extractContent({ 
-          url: result.url, 
-          timeout: 6000 // Reduced timeout to 6 seconds per page
-        });
-        
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Content extraction timeout')), 8000);
-        });
-        
-        const content = await Promise.race([extractionPromise, timeoutPromise]);
-        const cleanedContent = cleanText(content, this.maxContentLength);
-        
-        console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
-        return {
-          ...result,
-          fullContent: cleanedContent,
-          contentPreview: getContentPreview(cleanedContent),
-          wordCount: getWordCount(cleanedContent),
-          timestamp: generateTimestamp(),
-          fetchStatus: 'success' as const,
-        };
-      } catch (error) {
-        console.log(`[EnhancedContentExtractor] Failed to extract: ${result.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
-        return {
-          ...result,
-          fullContent: '',
-          contentPreview: '',
-          wordCount: 0,
-          timestamp: generateTimestamp(),
-          fetchStatus: 'error' as const,
-          error: this.getSpecificErrorMessage(error),
-        };
-      }
+  /**
+   * Decide which SERP entries are worth a fetch.
+   *
+   * PDFs are skipped (they are not parsed here) and results whose URLs describe the same page -
+   * `http`/`https`, `www.`, a trailing slash, a fragment, an `utm_` parameter - collapse into the
+   * highest ranked variant. Up to `targetCount * 3` candidates (never more than 10) stay queued:
+   * room to replace failures, without the old two-pages-per-request fan-out that fetched six pages
+   * for `limit: 2` even when the first two were fine.
+   */
+  planFollows(results: SearchResult[], targetCount: number): { nonPdf: number; unique: number; queue: SearchResult[] } {
+    const nonPdfResults = results.filter((result) => !isPdfUrl(result.url));
+
+    const seen = new Set<string>();
+    const uniqueResults = nonPdfResults.filter((result) => {
+      const key = this.cacheKey(result.url);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
-    
-    // Wait for all extractions to complete
-    const allResults = await Promise.all(extractionPromises);
-    
-    // Return successful results first, up to targetCount
-    const successfulResults = allResults.filter(r => r.fetchStatus === 'success');
-    const failedResults = allResults.filter(r => r.fetchStatus === 'error');
-    
-    // Combine successful and failed results, prioritizing successful ones
+
+    if (uniqueResults.length !== nonPdfResults.length) {
+      console.log(`[EnhancedContentExtractor] Collapsed ${nonPdfResults.length - uniqueResults.length} duplicate result URL(s), ${uniqueResults.length} unique left`);
+    }
+
+    const cap = Math.min(Math.max(targetCount * 3, targetCount + 1), 10);
+    return { nonPdf: nonPdfResults.length, unique: uniqueResults.length, queue: uniqueResults.slice(0, cap) };
+  }
+
+  /** Extract one result, with the per-page deadline that keeps a slow host from stalling a batch. */
+  private async extractOne(result: SearchResult): Promise<SearchResult> {
+    try {
+      // Use a race condition with timeout to prevent hanging
+      const extractionPromise = this.extractContent({
+        url: result.url,
+        timeout: 6000 // Reduced timeout to 6 seconds per page
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('Content extraction timeout')), 8000);
+        // do not let a lost race keep the event loop (and a browser) alive for another 8 seconds
+        timer.unref?.();
+      });
+
+      const content = await Promise.race([extractionPromise, timeoutPromise]);
+      const cleanedContent = cleanText(content, this.maxContentLength);
+
+      console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
+      return {
+        ...result,
+        fullContent: cleanedContent,
+        contentPreview: getContentPreview(cleanedContent),
+        wordCount: getWordCount(cleanedContent),
+        timestamp: generateTimestamp(),
+        fetchStatus: 'success' as const,
+      };
+    } catch (error) {
+      console.log(`[EnhancedContentExtractor] Failed to extract: ${result.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return {
+        ...result,
+        fullContent: '',
+        contentPreview: '',
+        wordCount: 0,
+        timestamp: generateTimestamp(),
+        fetchStatus: 'error' as const,
+        error: this.getSpecificErrorMessage(error),
+      };
+    }
+  }
+
+  async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
+    return (await this.extractContentForResultsDetailed(results, targetCount)).results;
+  }
+
+  /** Same as extractContentForResults, plus what it actually cost, for the tool status line. */
+  async extractContentForResultsDetailed(
+    results: SearchResult[],
+    targetCount: number = results.length,
+  ): Promise<{ results: SearchResult[]; stats: { candidates: number; fetched: number; succeeded: number; failed: number; cache: string } }> {
+    const { nonPdf, unique, queue } = this.planFollows(results, targetCount);
+    console.log(`[EnhancedContentExtractor] ${results.length} results → ${nonPdf} non-PDF → ${unique} unique; will fetch at most ${queue.length} to get ${targetCount}`);
+
+    const fetched: SearchResult[] = [];
+    let cursor = 0;
+
+    // Batches instead of a fan-out: the next batch only runs when the previous one came back short,
+    // so a healthy SERP costs exactly targetCount page loads.
+    while (cursor < queue.length) {
+      const succeeded = fetched.filter((r) => r.fetchStatus === 'success').length;
+      if (succeeded >= targetCount) break;
+
+      const batch = queue.slice(cursor, cursor + Math.max(1, targetCount - succeeded));
+      cursor += batch.length;
+      fetched.push(...(await Promise.all(batch.map((result) => this.extractOne(result)))));
+    }
+
+    // Preserve SERP rank; successes first, failures only as fillers up to targetCount.
+    const rank = new Map(queue.map((result, index) => [result.url, index]));
+    const byRank = (a: SearchResult, b: SearchResult) => (rank.get(a.url) ?? 0) - (rank.get(b.url) ?? 0);
+    const successfulResults = fetched.filter((r) => r.fetchStatus === 'success').sort(byRank);
+    const failedResults = fetched.filter((r) => r.fetchStatus === 'error').sort(byRank);
+
     const enhancedResults = [
       ...successfulResults.slice(0, targetCount),
-      ...failedResults.slice(0, Math.max(0, targetCount - successfulResults.length))
+      ...failedResults.slice(0, Math.max(0, targetCount - successfulResults.length)),
     ].slice(0, targetCount);
-    
-    console.log(`[EnhancedContentExtractor] Completed processing ${resultsToProcess.length} results, extracted ${successfulResults.length} successful/${failedResults.length} failed`);
-    return enhancedResults;
+
+    const stats = {
+      candidates: queue.length,
+      fetched: fetched.length,
+      // succeeded/failed count the pages that were fetched; only targetCount of them are returned
+      succeeded: successfulResults.length,
+      failed: failedResults.length,
+      cache: this.getCacheSummary(),
+    };
+
+    console.log(`[EnhancedContentExtractor] Fetched ${fetched.length} of ${queue.length} candidates: ${stats.succeeded} successful/${stats.failed} failed; ${stats.cache}`);
+    return { results: enhancedResults, stats };
   }
 
   /**

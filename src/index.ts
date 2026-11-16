@@ -407,29 +407,48 @@ class WebSearchMCPServer {
       
       // Log search summary
       const pdfCount = searchResults.filter(result => isPdfUrl(result.url)).length;
-      const followedCount = searchResults.length - pdfCount;
-      console.error(`[web-search-mcp] DEBUG: Search engine: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained; PDF: ${pdfCount}; ${followedCount} followed.`);
 
-      // Extract content from each result if requested, with target count
-      const enhancedResults = includeContent 
-        ? await this.contentExtractor.extractContentForResults(searchResults, limit)
-        : searchResults.slice(0, limit); // If not extracting content, just take the first 'limit' results
+      // Extract content from each result if requested, with target count.
+      // The extractor follows in batches and stops as soon as `limit` pages are in hand, so the
+      // numbers below are what actually happened: the status line used to claim `followedCount`
+      // links had been opened when it was just "search results that were not PDFs", which read as
+      // "6 followed" for a `limit: 2` call.
+      let enhancedResults: SearchResult[];
+      let follow:
+        | { candidates: number; fetched: number; succeeded: number; failed: number; cache: string }
+        | undefined;
+
+      if (includeContent) {
+        const detailed = await this.contentExtractor.extractContentForResultsDetailed(searchResults, limit);
+        enhancedResults = detailed.results;
+        follow = detailed.stats;
+        console.error(`[web-search-mcp] DEBUG: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained (${searchResults.length - pdfCount} non-PDF); ${follow.candidates} unique candidates; ${follow.fetched} links followed.`);
+      } else {
+        // No content requested: hand back the top results as the engine ranked them.
+        enhancedResults = searchResults.slice(0, limit);
+        console.error(`[web-search-mcp] DEBUG: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained; PDF: ${pdfCount}; content not fetched.`);
+      }
       
       // Log extraction summary with failure reasons and generate combined status
-      let combinedStatus = `Search engine: ${searchResponse.engine}; ${limit} result requested/${searchResults.length} obtained; PDF: ${pdfCount}; ${followedCount} followed`;
+      let combinedStatus = `Search engine: ${searchResponse.engine}; ${limit} result requested/${searchResults.length} obtained; PDF: ${pdfCount}` +
+        (follow ? `; unique candidates: ${follow.candidates}; links followed: ${follow.fetched}` : `; content not fetched`);
       
-      if (includeContent) {
+      if (includeContent && follow) {
         const successCount = enhancedResults.filter(r => r.fetchStatus === 'success').length;
         const failedResults = enhancedResults.filter(r => r.fetchStatus === 'error');
         const failedCount = failedResults.length;
         
         const failureReasons = this.categorizeFailureReasons(failedResults);
         const failureReasonText = failureReasons.length > 0 ? ` (${failureReasons.join(', ')})` : '';
+        // A candidate that failed and was replaced by the next one never reaches the result list.
+        // Say so, or "links followed: 3" next to "Failed: 0" reads like a contradiction.
+        const replaced = Math.max(0, follow.failed - failedCount);
+        const replacedText = replaced > 0 ? ` (${replaced} candidate${replaced === 1 ? ' was' : 's were'} replaced after an error)` : '';
         
-        console.error(`[web-search-mcp] DEBUG: Links requested: ${limit}; Successfully extracted: ${successCount}; Failed: ${failedCount}${failureReasonText}; Results: ${enhancedResults.length}.`);
+        console.error(`[web-search-mcp] DEBUG: Links requested: ${limit}; Successfully extracted: ${successCount}; Failed: ${failedCount}${failureReasonText}; Replaced: ${replaced}; Results: ${enhancedResults.length}; ${follow.cache}.`);
         
         // Add extraction info to combined status
-        combinedStatus += `; Successfully extracted: ${successCount}; Failed: ${failedCount}; Results: ${enhancedResults.length}`;
+        combinedStatus += `; Successfully extracted: ${successCount}; Failed: ${failedCount}${replacedText}; Results: ${enhancedResults.length}; ${follow.cache}`;
       }
 
       const searchTime = Date.now() - startTime;

@@ -221,6 +221,37 @@ and their results are used as-is (the relevance heuristic is skipped, so credits
 When DuckDuckGo returns a bot challenge the engine is put on a 15-minute cooldown inside the
 server process, so a broken search does not keep hammering the endpoint and deepen the flag.
 
+### Caching, de-duplication and throttling
+
+Repeated traffic is what gets a datacenter IP rate-limited, and repeated traffic is normal in an
+agent session: the same article fetched twice, the same query re-asked after a tool error. Both are
+now answered from memory.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SEARCH_CACHE_TTL_MINUTES` | `15` | How long a query's SERP is reused. A cached answer says so: `Search engine: DuckDuckGo Browser (cached)` |
+| `CONTENT_CACHE_TTL_MINUTES` | `30` | How long an extracted page is kept, keyed by the de-duplicated URL |
+| `FAILED_EXTRACTION_CACHE_TTL_MINUTES` | `5` | How long a refused URL is refused again without a second request. The cached reason is preserved (`... (same failure 297s ago; ...)`) so the error category is unchanged |
+| `EMPTY_RESULT_CACHE_TTL_SECONDS` | `120` | An empty SERP is usually a wall, not "no results", so it is remembered only briefly |
+| `CACHE_MAX_ENTRIES` | `200` | LRU bound for both caches |
+| `ENGINE_MIN_INTERVAL_MS` | `1000` | Minimum spacing between two requests to the *same* free engine. Different engines do not wait for each other; keyed providers are never throttled |
+| `NO_CACHE` | unset | `true` disables all caching (read-only debugging of a page the site has already changed) |
+
+Search results are also de-duplicated by URL: `http`/`https`, `www.`, a trailing slash, a fragment
+and tracking parameters (`utm_*`, `fbclid`, `gclid`, `ref`, …) describe one page, so the highest
+ranked variant is kept and the others are dropped before anything is fetched.
+
+`full-web-search` follows links in **batches** sized to what is still missing, instead of opening
+two pages per requested result up front: `limit: 2` over a healthy SERP now costs two page loads
+instead of four, and backfills from the queue only when one of them fails. The tool status line
+reports what actually happened:
+
+```
+Search engine: DuckDuckGo Browser; 2 result requested/6 obtained; PDF: 1; unique candidates: 5;
+links followed: 3; Successfully extracted: 2; Failed: 0 (1 candidate was replaced after an error);
+Results: 2; page cache 2/6 hits, 2 entries
+```
+
 ## Troubleshooting
 
 ### Slow Response Times
@@ -266,6 +297,23 @@ npm run build  # Build TypeScript to JavaScript
 npm run lint   # Run ESLint
 npm run format # Run Prettier
 ```
+
+### Tests
+
+`npm run build` first - the scripts below import from `dist/`.
+
+```bash
+node tests/test-dedupe-cache.js   # offline: URL de-duplication, TTL caches, single-flight,
+                                  #         batched link following, engine throttle (no network)
+node tests/test-all-engines.js    # live engine chain, quality heuristic, timings
+node tests/test-search.js         # live single query through the chain
+node tests/test-duckduckgo.js     # live DuckDuckGo parsers
+node tests/test-bing.js           # live Bing parsers
+node tests/test-brave.js          # live Brave parsers
+```
+
+`test-dedupe-cache.js` is deterministic and finishes in about a second; the rest depend on the
+network and on what the free engines currently allow this egress IP.
 
 ## MCP Tools
 

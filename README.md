@@ -2,13 +2,20 @@
 
 A TypeScript MCP (Model Context Protocol) server that provides comprehensive web search capabilities using direct connections (no API keys required) with multiple tools for different use cases.
 
+## Platform
+
+- **Debian 13 (Trixie) native**: Playwright 1.65.1+ ships Debian 13 browser builds (no Ubuntu 20.04 fallback).
+- Chromium, Firefox and WebKit start without extra library workarounds.
+- Prefers the system Chrome when available (`BROWSER_CHANNEL=auto`).
+
 ## Features
 
-- **Multi-Engine Web Search**: Prioritises Bing > Brave > DuckDuckGo for optimal reliability and performance
+- **Multi-Engine Web Search**: Prioritises configured API providers (SearXNG / Serper / Brave API / Tavily) over the free engines, then DuckDuckGo > Bing > Brave
 - **Full Page Content Extraction**: Fetches and extracts complete page content from search results
 - **Multiple Search Tools**: Three specialised tools for different use cases
 - **Smart Request Strategy**: Switches between playwright browesrs and fast axios requests to ensure results are returned
 - **Concurrent Processing**: Extracts content from multiple pages simultaneously
+- **Debian 13 ready**: latest stable Playwright (1.65.1+) with native Debian 13 browser builds; no legacy Ubuntu fallbacks
 
 ## How It Works
 
@@ -16,13 +23,20 @@ The server provides three specialised tools for different web search needs:
 
 ### 1. `full-web-search` (Main Tool)
 When a comprehensive search is requested, the server uses an **optimised search strategy**:
-1. **Browser-based Bing Search** - Primary method using dedicated Chromium instance
-2. **Browser-based Brave Search** - Secondary option using dedicated Firefox instance
-3. **Axios DuckDuckGo Search** - Final fallback using traditional HTTP
-4. **Dedicated browser isolation**: Each search engine gets its own browser instance with automatic cleanup
-5. **Content extraction**: Tries axios first, then falls back to browser with human behavior simulation
-6. **Concurrent processing**: Extracts content from multiple pages simultaneously with timeout protection
-7. **HTTP/2 error recovery**: Automatically falls back to HTTP/1.1 when protocol errors occur
+1. **Provider APIs** - SearXNG, Serper, Brave Search API or Tavily, used when the matching
+   environment variable is set (results are taken as-is, no relevance heuristic)
+2. **DuckDuckGo Search** - `POST` to `html.duckduckgo.com` / `lite.duckduckgo.com` after warming up
+   a session cookie; `GET` is answered with a bot challenge, `POST` usually is not
+3. **DuckDuckGo Browser** - the same URL in real Chrome; used when the HTTP path is walled, since
+   DuckDuckGo's JS check passes in a browser but not in axios
+4. **Browser-based Bing Search** - Chrome instance (Bing serves poisoned SERPs to the bundled
+   headless shell, see `BROWSER_CHANNEL`); the relevance heuristic rejects unrelated results
+5. **Browser-based Brave Search** - Chrome first, Firefox on retry (Brave intermittently answers
+   with a challenge from datacenter IPs)
+5. **Dedicated browser isolation**: Each search engine gets its own browser instance with automatic cleanup
+6. **Content extraction**: Tries axios first, then falls back to browser with human behavior simulation
+7. **Concurrent processing**: Extracts content from multiple pages simultaneously with timeout protection
+8. **HTTP/2 error recovery**: Automatically falls back to HTTP/1.1 when protocol errors occur
 
 ### 2. `get-web-search-summaries` (Lightweight Alternative)
 For quick search results without full content extraction:
@@ -140,6 +154,43 @@ The server supports several environment variables for configuration:
 - **`MAX_BROWSERS`**: Maximum number of browser instances to maintain (default: 3)
 - **`BROWSER_TYPES`**: Comma-separated list of browser types to use (default: 'chromium,firefox', options: chromium, firefox, webkit)
 - **`BROWSER_FALLBACK_THRESHOLD`**: Number of axios failures before using browser fallback (default: 3)
+- **`BROWSER_CHANNEL`**: Which Chromium build the browser engines launch (default `auto`)
+  - `auto` - use the installed Google Chrome when one is found (`/opt/google/chrome/chrome`,
+    `/usr/bin/google-chrome`, `chromium`, ...), otherwise the bundled build
+  - `chrome` / `msedge` / `brave` - Playwright channel names; an absolute path is also accepted
+  - `off` (or `bundled`/`chromium`) - force Playwright's own headless shell
+
+  This matters more than it looks: search engines fingerprint Playwright's bundled headless shell
+  and answer it with CAPTCHAs (DuckDuckGo, Brave) or a deliberately unrelated SERP (Bing), while
+  the *same IP* through the real Chrome is served normally. Measured on one host, one moment:
+  `axios POST html.duckduckgo.com -> HTTP 202 challenge`, `real Chrome GET same URL -> 10 results`.
+  User agents are now derived from the launched browser version instead of a hardcoded Chrome/121
+  string, because a UA that contradicts the engine is itself a detection signal.
+- **`FIREFOX_EXECUTABLE_PATH`**: absolute path to a Firefox binary to use instead of Playwright's
+  bundled build (browser pool and the Brave search retry). A missing path is reported and ignored,
+  so a stale value cannot break search. Useful for distributions' Firefox and for fingerprint-patched
+  builds such as `invisible_playwright`.
+- **`BROWSER_EXTRA_ARGS`**: space separated extra switches appended to every browser launch
+  (content-extraction pool and all browser search engines)
+- **`FIREFOX_DISABLE_DOH`**: set to `true` to launch Firefox with `network.trr.mode=5` and
+  `network.dns.echconfig.enabled=false`
+
+### Censored or middleboxed networks
+
+On networks where middleboxes interfere with TLS to specific hosts, two knobs help:
+
+- Firefox enables DNS-over-HTTPS by default, which makes it negotiate Encrypted Client Hello; if
+  those sessions get reset, set `FIREFOX_DISABLE_DOH=true`. Chromium is unaffected here as long as
+  it does not use secure DNS (Playwright launches do not).
+- `BROWSER_EXTRA_ARGS` appends raw switches. Note Chrome evaluates only one `--disable-features`
+  switch and the last occurrence replaces Playwright's own list, so use it deliberately.
+
+Check which layer is actually broken before reaching for these. A measured example: `owasp.org`
+resolved to `216.150.16.129` (Vercel) and the TCP handshake to :443 simply timed out, with ICMP
+100% loss - that is IP/SNI level filtering, so no browser switch fixes it, while a plain `curl`
+request without any ECH support hung identically. Large Cloudflare downloads (1.3 MB) and
+`cdnjs` transfers went through the same path fine, so a "response capped after N KiB" symptom should
+be tested with a big download before concluding the browser is at fault.
 
 ### Search Quality and Engine Selection
 
@@ -147,6 +198,66 @@ The server supports several environment variables for configuration:
 - **`RELEVANCE_THRESHOLD`**: Minimum quality score for search results (0.0-1.0, default: 0.3)
 - **`FORCE_MULTI_ENGINE_SEARCH`**: Try all search engines and return best results (default: false)
 - **`DEBUG_BROWSER_LIFECYCLE`**: Enable detailed browser lifecycle logging for debugging (default: false)
+
+### Search Providers (recommended)
+
+The free HTML engines (DuckDuckGo, Bing, Brave) are tried without any configuration, but they
+frequently refuse requests from hosting/VPS egress IPs: DuckDuckGo answers `HTTP 202` with an
+image challenge, Bing returns a poisoned SERP (unrelated links), Brave answers `HTTP 429`.
+Configuring one of the providers below makes search deterministic, because the SERP is fetched
+by the provider's infrastructure instead of your IP. Engines that have a key are tried **first**
+and their results are used as-is (the relevance heuristic is skipped, so credits are not wasted).
+
+| Variable | Provider | Notes |
+| --- | --- | --- |
+| `SEARXNG_URL` | Self-hosted [SearXNG](https://docs.searxng.org/) | No key. The instance must allow JSON: `search.formats: [html, json]` in `settings.yml` |
+| `SERPER_API_KEY` | [Serper.dev](https://serper.dev) Google SERP API | 2 500 free credits, POST `https://google.serper.dev/search` |
+| `BRAVE_API_KEY` | [Brave Search API](https://brave.com/search/api/) | 2 000 free queries/month, 1 req/s, `X-Subscription-Token` header |
+| `TAVILY_API_KEY` | [Tavily](https://tavily.com) | 1 000 free credits, LLM-oriented results |
+
+```json
+"websearch": {
+  "command": "node",
+  "args": ["/path/to/web-search-mcp/dist/index.js"],
+  "env": {
+    "BRAVE_API_KEY": "BSA..."
+  }
+}
+```
+
+When DuckDuckGo returns a bot challenge the engine is put on a 15-minute cooldown inside the
+server process, so a broken search does not keep hammering the endpoint and deepen the flag.
+
+### Caching, de-duplication and throttling
+
+Repeated traffic is what gets a datacenter IP rate-limited, and repeated traffic is normal in an
+agent session: the same article fetched twice, the same query re-asked after a tool error. Both are
+now answered from memory.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SEARCH_CACHE_TTL_MINUTES` | `15` | How long a query's SERP is reused. A cached answer says so: `Search engine: DuckDuckGo Browser (cached)` |
+| `CONTENT_CACHE_TTL_MINUTES` | `30` | How long an extracted page is kept, keyed by the de-duplicated URL |
+| `FAILED_EXTRACTION_CACHE_TTL_MINUTES` | `5` | How long a refused URL is refused again without a second request. The cached reason is preserved (`... (same failure 297s ago; ...)`) so the error category is unchanged |
+| `EMPTY_RESULT_CACHE_TTL_SECONDS` | `120` | An empty SERP is usually a wall, not "no results", so it is remembered only briefly |
+| `CACHE_MAX_ENTRIES` | `200` | LRU bound for both caches |
+| `ENGINE_MIN_INTERVAL_MS` | `1000` | Minimum spacing between two requests to the *same* free engine. Different engines do not wait for each other; keyed providers are never throttled |
+| `NO_CACHE` | unset | `true` disables all caching (read-only debugging of a page the site has already changed) |
+
+Search results are also de-duplicated by URL: `http`/`https`, `www.`, a trailing slash, a fragment
+and tracking parameters (`utm_*`, `fbclid`, `gclid`, `ref`, …) describe one page, so the highest
+ranked variant is kept and the others are dropped before anything is fetched.
+
+`full-web-search` follows links in **batches** sized to what is still missing, instead of opening
+two pages per requested result up front: `limit: 2` over a healthy SERP now costs two page loads
+instead of four, and backfills from the queue only when one of them fails. The tool status line
+reports what actually happened:
+
+```
+Search engine: DuckDuckGo Browser; 2 result requested/6 obtained; PDF: 1; unique candidates: 5;
+links followed: 3; Successfully extracted: 2; Failed: 0 (1 candidate was replaced after an error);
+Results: 2; page cache 2/6 hits, 2 entries
+```
 
 ## Troubleshooting
 
@@ -157,6 +268,10 @@ The server supports several environment variables for configuration:
 - **Use fewer browsers**: Set `MAX_BROWSERS=1` to reduce memory usage
 
 ### Search Failures
+- **"0 results" / "Search engine: None"**: every free engine refused this IP. The tool response
+  now includes the reason and the providers you can configure - see
+  [Search Providers](#search-providers-recommended). Check with `DEBUG_BROWSER_LIFECYCLE=true`
+  and watch the server stderr for the per-engine log lines
 - **Check browser installation**: Run `npx playwright install` to ensure browsers are available
 - **Try headless mode**: Ensure `BROWSER_HEADLESS=true` (default) for server environments
 - **Network restrictions**: Some networks block browser automation - try different network or VPN
@@ -190,6 +305,23 @@ npm run lint   # Run ESLint
 npm run format # Run Prettier
 ```
 
+### Tests
+
+`npm run build` first - the scripts below import from `dist/`.
+
+```bash
+node tests/test-dedupe-cache.js   # offline: URL de-duplication, TTL caches, single-flight,
+                                  #         batched link following, engine throttle (no network)
+node tests/test-all-engines.js    # live engine chain, quality heuristic, timings
+node tests/test-search.js         # live single query through the chain
+node tests/test-duckduckgo.js     # live DuckDuckGo parsers
+node tests/test-bing.js           # live Bing parsers
+node tests/test-brave.js          # live Brave parsers
+```
+
+`test-dedupe-cache.js` is deterministic and finishes in about a second; the rest depend on the
+network and on what the free engines currently allow this egress IP.
+
 ## MCP Tools
 
 This server provides three specialised tools for different web search needs:
@@ -197,7 +329,7 @@ This server provides three specialised tools for different web search needs:
 ### 1. `full-web-search` (Main Tool)
 The most comprehensive web search tool that:
 1. Takes a search query and optional number of results (1-10, default 5)
-2. Performs a web search (tries Bing, then Brave, then DuckDuckGo if needed)
+2. Performs a web search (configured API providers first, then DuckDuckGo, Bing, Brave)
 3. Fetches full page content from each result URL with concurrent processing
 4. Returns structured data with search results and extracted content
 5. **Enhanced reliability**: HTTP/2 error recovery, reduced timeouts, and better error handling

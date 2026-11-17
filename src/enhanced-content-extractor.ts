@@ -2,14 +2,24 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { Page } from 'playwright';
 import { ContentExtractionOptions, SearchResult } from './types.js';
-import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl } from './utils.js';
+import { cleanText, getWordCount, getContentPreview, generateTimestamp, isPdfUrl, userAgentFor, normalizeForDedupe, envInt, envTtlMinutes } from './utils.js';
 import { BrowserPool } from './browser-pool.js';
+import { TtlCache, SingleFlight } from './cache.js';
 
 export class EnhancedContentExtractor {
   private readonly defaultTimeout: number;
   private readonly maxContentLength: number;
   private browserPool: BrowserPool;
   private fallbackThreshold: number;
+  /**
+   * Extracted pages, keyed by the de-duplicated URL. `full-web-search` and a follow-up
+   * `get-single-web-page-content` on the same article used to fetch it twice, and asking a
+   * bot-protected site the same question twice in a row is how a soft block becomes a hard one.
+   */
+  private readonly pageCache: TtlCache<string>;
+  /** Recently failed URLs, kept briefly so a retry storm does not hammer a walled host. */
+  private readonly failureCache: TtlCache<string>;
+  private readonly inflight = new SingleFlight();
 
   constructor() {
     this.defaultTimeout = parseInt(process.env.DEFAULT_TIMEOUT || '6000', 10);
@@ -26,11 +36,75 @@ export class EnhancedContentExtractor {
     
     this.browserPool = new BrowserPool();
     this.fallbackThreshold = parseInt(process.env.BROWSER_FALLBACK_THRESHOLD || '3', 10);
-    
+    const maxEntries = envInt('CACHE_MAX_ENTRIES', 200);
+    const pageTtlMs = envTtlMinutes('CONTENT_CACHE_TTL_MINUTES', 30);
+    this.pageCache = new TtlCache<string>(maxEntries, pageTtlMs);
+    this.failureCache = new TtlCache<string>(maxEntries, envTtlMinutes('FAILED_EXTRACTION_CACHE_TTL_MINUTES', 5));
+
     console.log(`[EnhancedContentExtractor] Configuration: timeout=${this.defaultTimeout}, maxContentLength=${this.maxContentLength}, fallbackThreshold=${this.fallbackThreshold}`);
+    console.log(`[EnhancedContentExtractor] Page cache: ${this.pageCache.enabled ? `${Math.round(pageTtlMs / 60000)} min TTL, ${maxEntries} entries max` : 'disabled'}`);
   }
 
+  /** One line for the tool status so the caller can tell a refetch from a cache hit. */
+  getCacheSummary(): string {
+    if (!this.pageCache.enabled) return 'page cache disabled';
+    return `page cache ${this.pageCache.summary()}, failures ${this.failureCache.summary()}`;
+  }
+
+  /** Cache key: the same article under two tracking URLs is one entry. */
+  private cacheKey(url: string): string {
+    return normalizeForDedupe(url);
+  }
+
+  private capTo(text: string, maxContentLength?: number): string {
+    return maxContentLength && maxContentLength > 0 && text.length > maxContentLength
+      ? text.substring(0, maxContentLength)
+      : text;
+  }
+
+  /**
+   * Cached wrapper around the actual extraction.
+   *
+   * The cache stores the page at the configured ceiling (MAX_CONTENT_LENGTH) and truncates per
+   * request, so one fetch serves callers asking for different lengths. A caller who explicitly
+   * asks for more than the ceiling bypasses the cache rather than getting a short copy of a page
+   * it asked in full for.
+   */
   async extractContent(options: ContentExtractionOptions): Promise<string> {
+    const { url, maxContentLength } = options;
+    const key = this.cacheKey(url);
+    const cacheable = maxContentLength === undefined || maxContentLength <= 0 || maxContentLength <= this.maxContentLength;
+
+    if (cacheable) {
+      const hit = this.pageCache.get(key);
+      if (hit !== undefined) {
+        console.log(`[EnhancedContentExtractor] Cache hit for ${url} (${hit.length} chars, ${this.pageCache.summary()})`);
+        return this.capTo(hit, maxContentLength);
+      }
+
+      const failure = this.failureCache.get(key);
+      if (failure !== undefined) {
+        // Deliberately an error again: the site refused it minutes ago and will refuse it now.
+        // The reason is preserved so index.ts still categorises it identically.
+        const left = this.failureCache.remainingFor(key);
+        console.log(`[EnhancedContentExtractor] Reusing cached failure for ${url} (${left}s left in cache)`);
+        throw new Error(`${failure} (same failure ${left}s ago; FAILED_EXTRACTION_CACHE_TTL_MINUTES controls this)`);
+      }
+    }
+
+    try {
+      const content = await this.inflight.run(key, () =>
+        this.extractUncached(cacheable ? { ...options, maxContentLength: undefined } : options),
+      );
+      if (cacheable) this.pageCache.set(key, content);
+      return this.capTo(content, maxContentLength);
+    } catch (error) {
+      if (cacheable) this.failureCache.set(key, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  private async extractUncached(options: ContentExtractionOptions): Promise<string> {
     const { url } = options;
     
     console.log(`[EnhancedContentExtractor] Starting extraction for: ${url}`);
@@ -41,7 +115,8 @@ export class EnhancedContentExtractor {
       console.log(`[EnhancedContentExtractor] Successfully extracted with axios: ${content.length} chars`);
       return content;
     } catch (error) {
-      console.log(`[EnhancedContentExtractor] Axios failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      const axiosReason = this.describeError(error);
+      console.log(`[EnhancedContentExtractor] Axios failed: ${axiosReason}`);
       
       // Check if this looks like a case where browser would help
       if (this.shouldUseBrowser(error, url)) {
@@ -51,13 +126,88 @@ export class EnhancedContentExtractor {
           console.log(`[EnhancedContentExtractor] Successfully extracted with browser: ${content.length} chars`);
           return content;
         } catch (browserError) {
+          const browserReason = this.describeError(browserError);
           console.error(`[EnhancedContentExtractor] Browser extraction also failed:`, browserError);
-          throw new Error(`Both axios and browser extraction failed for ${url}`);
+
+          // The caller only ever sees this string, and the previous "Both axios and browser
+          // extraction failed for <url>" told it nothing: a bot-protection wall, a DNS failure and
+          // a page with no text all looked identical.
+          const blocked = `${axiosReason} ${browserReason}`.toLowerCase().includes('interstitial');
+          const hint = blocked
+            ? ' The site is serving a bot-protection page instead of the article - try a different source.'
+            : '';
+
+          throw new Error(`Could not extract content from ${url}: HTTP said "${axiosReason}"; browser said "${browserReason}".${hint}`);
         }
       } else {
-        throw error;
+        // No browser fallback was warranted (404, DNS failure, TLS error, ...). Keep the reason -
+        // categorizeError() keys off it - but name the URL so the caller is not left guessing.
+        throw new Error(`Could not fetch ${url}: ${axiosReason}`);
       }
     }
+  }
+
+  /** Stable marker used both when rejecting low quality content and when deciding on a fallback. */
+  private static readonly LOW_QUALITY_PREFIX = 'low-quality content';
+
+  /**
+   * One-line, length-bounded description of a failure - axios errors can carry whole response
+   * bodies, which must not end up in an MCP tool response.
+   */
+  private describeError(error: unknown): string {
+    let reason: string;
+
+    if (axios.isAxiosError(error)) {
+      const status = error.response?.status;
+      if (status) {
+        reason = `HTTP ${status} ${error.response?.statusText ?? ''}`.trim();
+      } else {
+        // Network-level failures carry a code only. Spelling it out also lets index.ts
+        // categorise them - before this, "getaddrinfo ENOTFOUND host" matched nothing and came
+        // back as "Other error".
+        reason = this.describeNetworkCode(error.code, error.message);
+      }
+    } else {
+      reason = error instanceof Error ? error.message : String(error);
+    }
+
+    const clean = reason.replace(/\s+/g, ' ').replace(/^error:\s*/i, '').trim();
+    return clean.length > 180 ? `${clean.slice(0, 177)}...` : (clean || 'unknown error');
+  }
+
+  /** Translate axios network error codes into phrases that name the actual problem. */
+  private describeNetworkCode(code: string | undefined, message: string): string {
+    switch (code) {
+      case 'ENOTFOUND':
+      case 'EAI_AGAIN':
+        return `DNS lookup failed (${code})`;
+      case 'ECONNREFUSED':
+        return 'connection refused (ECONNREFUSED)';
+      case 'ECONNRESET':
+      case 'EPIPE':
+        return 'connection reset by peer';
+      case 'ETIMEDOUT':
+      case 'ECONNABORTED':
+        return `timed out (${code})`;
+      case 'ERR_NETWORK':
+        return 'network error';
+      default:
+        // TLS codes vary a lot (CERT_HAS_EXPIRED, ERR_TLS_CERT_ALTNAME_INVALID,
+        // DEPTH_ZERO_SELF_SIGNED_CERT, UNABLE_TO_VERIFY_LEAF_SIGNATURE...). Name them as TLS so the
+        // failure is not classified by an accidental substring of the hostname (e.g. badssl.com).
+        if (code && /CERT|TLS|SSL|SELF_SIGNED|UNKNOWN_CA/i.test(code)) {
+          return `TLS certificate error (${code})`;
+        }
+        return code || message || 'request failed';
+    }
+  }
+
+  /** Why the extracted text was rejected, phrased so the caller can act on it. */
+  private describeRejection(content: string): string {
+    if (this.isBlockPage(content)) {
+      return 'bot-protection interstitial (no article content)';
+    }
+    return `no usable article text (${content.trim().length} characters extracted)`;
   }
 
   private async extractWithAxios(options: ContentExtractionOptions): Promise<string> {
@@ -80,7 +230,7 @@ export class EnhancedContentExtractor {
     
     // Check if we got a meaningful response
     if (this.isLowQualityContent(content)) {
-      throw new Error('Low quality content detected - likely bot detection');
+      throw new Error(`${EnhancedContentExtractor.LOW_QUALITY_PREFIX}: ${this.describeRejection(content)}`);
     }
     
     return content;
@@ -95,7 +245,7 @@ export class EnhancedContentExtractor {
     try {
       // Create context options based on browser capabilities
       const baseContextOptions = {
-        userAgent: this.getRandomUserAgent(),
+        userAgent: await this.resolveUserAgent(browser),
         viewport: this.getRandomViewport(),
         locale: 'en-US',
         timezoneId: this.getRandomTimezone(),
@@ -181,7 +331,7 @@ export class EnhancedContentExtractor {
           // Create a new context with HTTP/1.1 preference
           await context.close();
           const http1Context = await browser.newContext({
-            userAgent: this.getRandomUserAgent(),
+            userAgent: await this.resolveUserAgent(browser),
             viewport: this.getRandomViewport(),
             locale: 'en-US',
             timezoneId: this.getRandomTimezone(),
@@ -237,6 +387,14 @@ export class EnhancedContentExtractor {
       const html = await page.content();
       const content = this.parseContent(html);
 
+      // The axios path already rejects bot-protection pages; the browser path did not, so a
+      // Cloudflare interstitial was returned as if it were the article (observed as a 516 char
+      // "Why have I been blocked?" body reported as a successful extraction).
+      if (this.isBlockPage(content)) {
+        await context.close();
+        throw new Error(`Bot protection interstitial detected for ${url} - the page was not extracted`);
+      }
+
       await context.close();
       return content;
 
@@ -287,7 +445,7 @@ export class EnhancedContentExtractor {
       error.message?.includes('timeout'),
       error.message?.includes('Access denied'),
       error.message?.includes('Forbidden'),
-      error.message?.includes('Low quality content detected'),
+      error.message?.includes(EnhancedContentExtractor.LOW_QUALITY_PREFIX),
       
       // Response content suggesting bot detection
       error.response?.data?.includes('Please enable JavaScript'),
@@ -307,14 +465,44 @@ export class EnhancedContentExtractor {
     return indicators.some(indicator => indicator === true);
   }
 
+  /**
+   * Fingerprints of anti-bot interstitials (Cloudflare, Akamai, Wordfence...). Phrases, not bare
+   * words: "captcha"/"robot" appear constantly in legitimate security documentation, and short
+   * matches there would reject real articles.
+   */
+  private isBlockPage(content: string): boolean {
+    const text = content.toLowerCase();
+
+    const markers = [
+      'why have i been blocked',
+      'security service to protect itself',
+      'triggered the security solution',
+      'attention required! this website',
+      'verifying you are human',
+      'checking your browser before connecting',
+      'enable javascript and cookies to continue',
+      'pardon our interruption',
+      'blocked by network security',
+      'access denied',
+      '403 forbidden',
+      'please enable javascript',
+      'unusual traffic',
+      'select all squares',
+      'enter the code you see above',
+    ];
+
+    return markers.some((marker) => text.includes(marker));
+  }
+
   private isLowQualityContent(content: string): boolean {
+    if (this.isBlockPage(content)) {
+      console.log(`[EnhancedContentExtractor] Detected a bot-protection interstitial, not article content`);
+      return true;
+    }
+
     const lowQualityIndicators = [
       content.length < 100,
-      content.includes('Please enable JavaScript'),
-      content.includes('Access Denied'),
-      content.includes('403 Forbidden'),
       content.includes('captcha'),
-      content.includes('unusual traffic'),
       content.includes('robot'),
       content.trim() === '',
     ];
@@ -360,6 +548,19 @@ export class EnhancedContentExtractor {
     };
   }
 
+  /**
+   * A UA that contradicts the engine actually running (Chrome/121 string on Chrome/156, or a
+   * Chrome UA on Firefox) is itself a detection signal, so when the browser reports its version
+   * build a matching UA and only fall back to the random list otherwise.
+   */
+  private async resolveUserAgent(browser: { browserType: () => { name: () => string }; version: () => string }): Promise<string> {
+    try {
+      return userAgentFor(browser.browserType().name(), browser.version());
+    } catch {
+      return this.getRandomUserAgent();
+    }
+  }
+
   private getRandomUserAgent(): string {
     const userAgents = [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -397,69 +598,214 @@ export class EnhancedContentExtractor {
     return timezones[Math.floor(Math.random() * timezones.length)];
   }
 
-  async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
-    console.log(`[EnhancedContentExtractor] Processing up to ${results.length} results to get ${targetCount} non-PDF results`);
-    
-    // Filter out PDF files first
-    const nonPdfResults = results.filter(result => !isPdfUrl(result.url));
-    const resultsToProcess = nonPdfResults.slice(0, Math.min(targetCount * 2, 10)); // Process extra to account for failures
-    
-    console.log(`[EnhancedContentExtractor] Processing ${resultsToProcess.length} non-PDF results concurrently`);
-    
-    // Process results concurrently with timeout
-    const extractionPromises = resultsToProcess.map(async (result): Promise<SearchResult> => {
-      try {
-        // Use a race condition with timeout to prevent hanging
-        const extractionPromise = this.extractContent({ 
-          url: result.url, 
-          timeout: 6000 // Reduced timeout to 6 seconds per page
-        });
-        
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Content extraction timeout')), 8000);
-        });
-        
-        const content = await Promise.race([extractionPromise, timeoutPromise]);
-        const cleanedContent = cleanText(content, this.maxContentLength);
-        
-        console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
-        return {
-          ...result,
-          fullContent: cleanedContent,
-          contentPreview: getContentPreview(cleanedContent),
-          wordCount: getWordCount(cleanedContent),
-          timestamp: generateTimestamp(),
-          fetchStatus: 'success' as const,
-        };
-      } catch (error) {
-        console.log(`[EnhancedContentExtractor] Failed to extract: ${result.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
-        return {
-          ...result,
-          fullContent: '',
-          contentPreview: '',
-          wordCount: 0,
-          timestamp: generateTimestamp(),
-          fetchStatus: 'error' as const,
-          error: this.getSpecificErrorMessage(error),
-        };
-      }
+  /**
+   * Decide which SERP entries are worth a fetch.
+   *
+   * PDFs are skipped (they are not parsed here) and results whose URLs describe the same page -
+   * `http`/`https`, `www.`, a trailing slash, a fragment, an `utm_` parameter - collapse into the
+   * highest ranked variant. Up to `targetCount * 3` candidates (never more than 10) stay queued:
+   * room to replace failures, without the old two-pages-per-request fan-out that fetched six pages
+   * for `limit: 2` even when the first two were fine.
+   */
+  planFollows(results: SearchResult[], targetCount: number): { nonPdf: number; unique: number; queue: SearchResult[] } {
+    const nonPdfResults = results.filter((result) => !isPdfUrl(result.url));
+
+    const seen = new Set<string>();
+    const uniqueResults = nonPdfResults.filter((result) => {
+      const key = this.cacheKey(result.url);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
-    
-    // Wait for all extractions to complete
-    const allResults = await Promise.all(extractionPromises);
-    
-    // Return successful results first, up to targetCount
-    const successfulResults = allResults.filter(r => r.fetchStatus === 'success');
-    const failedResults = allResults.filter(r => r.fetchStatus === 'error');
-    
-    // Combine successful and failed results, prioritizing successful ones
+
+    if (uniqueResults.length !== nonPdfResults.length) {
+      console.log(`[EnhancedContentExtractor] Collapsed ${nonPdfResults.length - uniqueResults.length} duplicate result URL(s), ${uniqueResults.length} unique left`);
+    }
+
+    const cap = Math.min(Math.max(targetCount * 3, targetCount + 1), 10);
+    return { nonPdf: nonPdfResults.length, unique: uniqueResults.length, queue: uniqueResults.slice(0, cap) };
+  }
+
+  /** Extract one result, with the per-page deadline that keeps a slow host from stalling a batch. */
+  private async extractOne(result: SearchResult): Promise<SearchResult> {
+    try {
+      // Use a race condition with timeout to prevent hanging
+      const extractionPromise = this.extractContent({
+        url: result.url,
+        timeout: 6000 // Reduced timeout to 6 seconds per page
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('Content extraction timeout')), 8000);
+        // do not let a lost race keep the event loop (and a browser) alive for another 8 seconds
+        timer.unref?.();
+      });
+
+      const content = await Promise.race([extractionPromise, timeoutPromise]);
+      const cleanedContent = cleanText(content, this.maxContentLength);
+
+      console.log(`[EnhancedContentExtractor] Successfully extracted: ${result.url}`);
+      return {
+        ...result,
+        fullContent: cleanedContent,
+        contentPreview: getContentPreview(cleanedContent),
+        wordCount: getWordCount(cleanedContent),
+        timestamp: generateTimestamp(),
+        fetchStatus: 'success' as const,
+      };
+    } catch (error) {
+      console.log(`[EnhancedContentExtractor] Failed to extract: ${result.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return {
+        ...result,
+        fullContent: '',
+        contentPreview: '',
+        wordCount: 0,
+        timestamp: generateTimestamp(),
+        fetchStatus: 'error' as const,
+        error: this.getSpecificErrorMessage(error),
+      };
+    }
+  }
+
+  async extractContentForResults(results: SearchResult[], targetCount: number = results.length): Promise<SearchResult[]> {
+    return (await this.extractContentForResultsDetailed(results, targetCount)).results;
+  }
+
+  /** Same as extractContentForResults, plus what it actually cost, for the tool status line. */
+  async extractContentForResultsDetailed(
+    results: SearchResult[],
+    targetCount: number = results.length,
+  ): Promise<{ results: SearchResult[]; stats: { candidates: number; fetched: number; succeeded: number; failed: number; cache: string } }> {
+    const { nonPdf, unique, queue } = this.planFollows(results, targetCount);
+    console.log(`[EnhancedContentExtractor] ${results.length} results → ${nonPdf} non-PDF → ${unique} unique; will fetch at most ${queue.length} to get ${targetCount}`);
+
+    const fetched: SearchResult[] = [];
+    let cursor = 0;
+
+    // Batches instead of a fan-out: the next batch only runs when the previous one came back short,
+    // so a healthy SERP costs exactly targetCount page loads.
+    while (cursor < queue.length) {
+      const succeeded = fetched.filter((r) => r.fetchStatus === 'success').length;
+      if (succeeded >= targetCount) break;
+
+      const batch = queue.slice(cursor, cursor + Math.max(1, targetCount - succeeded));
+      cursor += batch.length;
+      fetched.push(...(await Promise.all(batch.map((result) => this.extractOne(result)))));
+    }
+
+    // Preserve SERP rank; successes first, failures only as fillers up to targetCount.
+    const rank = new Map(queue.map((result, index) => [result.url, index]));
+    const byRank = (a: SearchResult, b: SearchResult) => (rank.get(a.url) ?? 0) - (rank.get(b.url) ?? 0);
+    const successfulResults = fetched.filter((r) => r.fetchStatus === 'success').sort(byRank);
+    const failedResults = fetched.filter((r) => r.fetchStatus === 'error').sort(byRank);
+
     const enhancedResults = [
       ...successfulResults.slice(0, targetCount),
-      ...failedResults.slice(0, Math.max(0, targetCount - successfulResults.length))
+      ...failedResults.slice(0, Math.max(0, targetCount - successfulResults.length)),
     ].slice(0, targetCount);
-    
-    console.log(`[EnhancedContentExtractor] Completed processing ${resultsToProcess.length} results, extracted ${successfulResults.length} successful/${failedResults.length} failed`);
-    return enhancedResults;
+
+    const stats = {
+      candidates: queue.length,
+      fetched: fetched.length,
+      // succeeded/failed count the pages that were fetched; only targetCount of them are returned
+      succeeded: successfulResults.length,
+      failed: failedResults.length,
+      cache: this.getCacheSummary(),
+    };
+
+    console.log(`[EnhancedContentExtractor] Fetched ${fetched.length} of ${queue.length} candidates: ${stats.succeeded} successful/${stats.failed} failed; ${stats.cache}`);
+    return { results: enhancedResults, stats };
+  }
+
+  /**
+   * Words that mark a class/ID as page chrome rather than article text. Matched against whole
+   * tokens (split on -, _, space, camelCase boundaries), so `mw-header` is dropped but a class
+   * like `download-links` or `grade-scale` is not.
+   */
+  private static readonly NOISE_TOKENS = new Set([
+    'ad', 'ads', 'advert', 'advertisement', 'advertisements', 'adunit', 'adsense', 'tracking', 'tracker',
+    'analytics', 'pixel', 'beacon', 'sponsored', 'affiliate', 'affiliates', 'promo', 'promotion',
+    'banner', 'banners', 'popup', 'popups', 'modal', 'overlay', 'tooltip', 'toolbar', 'ribbon',
+    'sidebar', 'sidebars', 'navigation', 'nav', 'menu', 'menubar', 'footer', 'header', 'topbar',
+    'breadcrumb', 'breadcrumbs', 'share', 'sharing', 'social', 'newsletter', 'subscribe', 'subscription',
+    'comment', 'comments', 'disclaimer', 'cookie', 'cookies', 'privacy', 'terms', 'legal', 'copyright',
+    'login', 'signin', 'signup', 'search', 'searchbox', 'pagination', 'pager', 'related', 'recommendations',
+    'metadata', 'byline', 'tags', 'categories'
+  ]);
+
+  private tokenizeClass(value: string): string[] {
+    return value
+      .toLowerCase()
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean);
+  }
+
+  /**
+   * Token-aware removal of ad/navigation chrome. Safe by construction:
+   *  - only whole tokens are compared (no `*="ad"` substring matching)
+   *  - structural/root elements are never removed
+   *  - an element carrying more than 40% of the page text is kept (it is the article wrapper,
+   *    not an ad slot)
+   */
+  private removeNoiseElements($: cheerio.CheerioAPI): void {
+    const bodyTextLength = $('body').text().trim().length || $('html').text().trim().length || 1;
+
+    for (const attribute of ['class', 'id'] as const) {
+      $(`[${attribute}]`).each((_index, element) => {
+        const $element = $(element);
+        const raw = $element.attr(attribute);
+        if (!raw) return;
+        if (!this.tokenizeClass(raw).some(token => EnhancedContentExtractor.NOISE_TOKENS.has(token))) return;
+
+        const tagName = (element as any).tagName?.toString().toLowerCase() ?? '';
+        if (tagName === 'html' || tagName === 'body') return;
+        if ($element.is('main, article, [role="main"]')) return;
+
+        const elementTextLength = $element.text().trim().length;
+        if (elementTextLength / bodyTextLength > 0.4) return; // wraps the real content
+
+        $element.remove();
+      });
+    }
+  }
+
+  /**
+   * Fallback extraction: re-parse the raw HTML and return the text of the container with the
+   * highest amount of readable text (classic readability heuristic, link-density penalised).
+   */
+  private extractDensestTextBlock(html: string): string {
+    try {
+      const $ = cheerio.load(html);
+      $('script, style, noscript, template, svg, code, kbd').remove();
+
+      let best = '';
+      let bestScore = 0;
+      let considered = 0;
+
+      $('article, main, [role="main"], section, div, td').each((_index, element) => {
+        if (considered++ > 3000) return false;
+        const $element = $(element);
+        const text = $element.text().replace(/\s+/g, ' ').trim();
+        if (text.length < 200) return;
+
+        const linkText = $element.find('a').toArray().reduce((sum, a) => sum + $(a).text().trim().length, 0);
+        const linkDensity = Math.min(linkText / text.length, 1);
+        const score = text.length * (1 - linkDensity);
+
+        if (score > bestScore) {
+          bestScore = score;
+          best = text;
+        }
+      });
+
+      if (best) {
+        console.log(`[EnhancedContentExtractor] Densest text block: ${best.length} chars (score ${Math.round(bestScore)})`);
+      }
+      return best;
+    } catch {
+      return '';
+    }
   }
 
   private parseContent(html: string): string {
@@ -468,14 +814,17 @@ export class EnhancedContentExtractor {
     // Remove all script, style, and other non-content elements
     $('script, style, noscript, iframe, img, video, audio, canvas, svg, object, embed, applet, form, input, textarea, select, button, label, fieldset, legend, optgroup, option').remove();
     
-    // Remove navigation, header, footer, and other non-content elements
-    $('nav, header, footer, .nav, .header, .footer, .sidebar, .menu, .breadcrumb, aside, .ad, .advertisement, .ads, .advertisement-container, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommendations, .newsletter-signup, .cookie-notice, .privacy-notice, .terms-notice, .disclaimer, .legal, .copyright, .meta, .metadata, .author-info, .publish-date, .tags, .categories, .navigation, .pagination, .search-box, .search-form, .login-form, .signup-form, .newsletter, .popup, .modal, .overlay, .tooltip, .toolbar, .ribbon, .banner, .promo, .sponsored, .affiliate, .tracking, .analytics, .pixel, .beacon').remove();
+    // Remove block-level navigation chrome (tag level). Class/ID based noise is handled by
+    // removeNoiseElements() below, which is token-aware and protects content wrappers.
+    $('nav, header, footer').remove();
     
-    // Remove elements with common ad/tracking classes
-    $('[class*="ad"], [class*="ads"], [class*="advertisement"], [class*="tracking"], [class*="analytics"], [class*="pixel"], [class*="beacon"], [class*="sponsored"], [class*="affiliate"], [class*="promo"], [class*="banner"], [class*="popup"], [class*="modal"], [class*="overlay"], [class*="tooltip"], [class*="toolbar"], [class*="ribbon"]').remove();
-    
-    // Remove elements with common non-content IDs
-    $('[id*="ad"], [id*="ads"], [id*="advertisement"], [id*="tracking"], [id*="analytics"], [id*="pixel"], [id*="beacon"], [id*="sponsored"], [id*="affiliate"], [id*="promo"], [id*="banner"], [id*="popup"], [id*="modal"], [id*="overlay"], [id*="tooltip"], [id*="toolbar"], [id*="ribbon"], [id*="sidebar"], [id*="navigation"], [id*="menu"], [id*="footer"], [id*="header"]').remove();
+    // Remove elements whose class/ID *tokens* mark them as ad/tracking/chrome noise.
+    // NOTE: this deliberately does NOT use `[class*="ad"]` style substring matching: the
+    // substring "ad" also occurs in totally innocent names ("header", "grade", "download"...),
+    // which used to delete whole sites (e.g. every Wikipedia article, because `mw-header-*`
+    // wraps the page). Matching is per word/token and never removes an element that holds
+    // most of the page text.
+    this.removeNoiseElements($);
     
     // Remove image-related elements and attributes
     $('picture, source, figure, figcaption, .image, .img, .photo, .picture, .media, .gallery, .slideshow, .carousel').remove();
@@ -528,6 +877,13 @@ export class EnhancedContentExtractor {
     if (!mainContent || mainContent.length < 100) {
       console.log(`[EnhancedContentExtractor] No main content found, using body content`);
       mainContent = $('body').text().trim();
+    }
+
+    // Last resort: the filters above (or a weird DOM) left us with nothing usable - re-parse the
+    // untouched HTML and take the densest text block instead of returning an empty page.
+    if (!mainContent || mainContent.length < 100) {
+      console.log(`[EnhancedContentExtractor] Body content unusable, falling back to densest text block`);
+      mainContent = this.extractDensestTextBlock(html);
     }
     
     // Clean up the text

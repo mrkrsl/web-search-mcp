@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { SearchEngine } from './search-engine.js';
 import { EnhancedContentExtractor } from './enhanced-content-extractor.js';
 import { WebSearchToolInput, WebSearchToolOutput, SearchResult } from './types.js';
-import { isPdfUrl } from './utils.js';
+import { isPdfUrl, getNoResultsGuidance } from './utils.js';
 
 class WebSearchMCPServer {
   private server: McpServer;
@@ -103,6 +103,10 @@ class WebSearchMCPServer {
           // Add status line if available
           if (result.status) {
             responseText += `**Status:** ${result.status}\n\n`;
+          }
+
+          if (result.total_results === 0) {
+            responseText += `${getNoResultsGuidance()}\n\n`;
           }
           
           const maxLength = validatedArgs.maxContentLength;
@@ -207,6 +211,10 @@ class WebSearchMCPServer {
             
             // Format the results as text
             let responseText = `Search summaries for "${obj.query}" with ${summaryResults.length} results:\n\n`;
+
+            if (summaryResults.length === 0) {
+              responseText += `${getNoResultsGuidance()}\n\n`;
+            }
             
             summaryResults.forEach((summary, i) => {
               responseText += `**${i + 1}. ${summary.title}**\n`;
@@ -296,6 +304,22 @@ class WebSearchMCPServer {
 
           console.log(`[MCP] Single page content extraction completed, extracted ${content.length} characters`);
 
+          if (!content.trim()) {
+            console.error(`[MCP] Extraction produced no text for ${obj.url}`);
+            return {
+              isError: true,
+              content: [
+                {
+                  type: 'text' as const,
+                  text:
+                    `Could not extract any text from ${obj.url}. The page is either JavaScript-only, ` +
+                    `served a bot challenge, or returned an empty body. Try a different URL (or the ` +
+                    `AMP/canonical/print variant) instead of treating this as an empty page.`,
+                },
+              ],
+            };
+          }
+
           // Format the result as text
           let responseText = `**Page Content from: ${obj.url}**\n\n`;
           responseText += `**Title:** ${title}\n`;
@@ -383,29 +407,48 @@ class WebSearchMCPServer {
       
       // Log search summary
       const pdfCount = searchResults.filter(result => isPdfUrl(result.url)).length;
-      const followedCount = searchResults.length - pdfCount;
-      console.error(`[web-search-mcp] DEBUG: Search engine: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained; PDF: ${pdfCount}; ${followedCount} followed.`);
 
-      // Extract content from each result if requested, with target count
-      const enhancedResults = includeContent 
-        ? await this.contentExtractor.extractContentForResults(searchResults, limit)
-        : searchResults.slice(0, limit); // If not extracting content, just take the first 'limit' results
+      // Extract content from each result if requested, with target count.
+      // The extractor follows in batches and stops as soon as `limit` pages are in hand, so the
+      // numbers below are what actually happened: the status line used to claim `followedCount`
+      // links had been opened when it was just "search results that were not PDFs", which read as
+      // "6 followed" for a `limit: 2` call.
+      let enhancedResults: SearchResult[];
+      let follow:
+        | { candidates: number; fetched: number; succeeded: number; failed: number; cache: string }
+        | undefined;
+
+      if (includeContent) {
+        const detailed = await this.contentExtractor.extractContentForResultsDetailed(searchResults, limit);
+        enhancedResults = detailed.results;
+        follow = detailed.stats;
+        console.error(`[web-search-mcp] DEBUG: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained (${searchResults.length - pdfCount} non-PDF); ${follow.candidates} unique candidates; ${follow.fetched} links followed.`);
+      } else {
+        // No content requested: hand back the top results as the engine ranked them.
+        enhancedResults = searchResults.slice(0, limit);
+        console.error(`[web-search-mcp] DEBUG: ${searchResponse.engine}; ${limit} requested/${searchResults.length} obtained; PDF: ${pdfCount}; content not fetched.`);
+      }
       
       // Log extraction summary with failure reasons and generate combined status
-      let combinedStatus = `Search engine: ${searchResponse.engine}; ${limit} result requested/${searchResults.length} obtained; PDF: ${pdfCount}; ${followedCount} followed`;
+      let combinedStatus = `Search engine: ${searchResponse.engine}; ${limit} result requested/${searchResults.length} obtained; PDF: ${pdfCount}` +
+        (follow ? `; unique candidates: ${follow.candidates}; links followed: ${follow.fetched}` : `; content not fetched`);
       
-      if (includeContent) {
+      if (includeContent && follow) {
         const successCount = enhancedResults.filter(r => r.fetchStatus === 'success').length;
         const failedResults = enhancedResults.filter(r => r.fetchStatus === 'error');
         const failedCount = failedResults.length;
         
         const failureReasons = this.categorizeFailureReasons(failedResults);
         const failureReasonText = failureReasons.length > 0 ? ` (${failureReasons.join(', ')})` : '';
+        // A candidate that failed and was replaced by the next one never reaches the result list.
+        // Say so, or "links followed: 3" next to "Failed: 0" reads like a contradiction.
+        const replaced = Math.max(0, follow.failed - failedCount);
+        const replacedText = replaced > 0 ? ` (${replaced} candidate${replaced === 1 ? ' was' : 's were'} replaced after an error)` : '';
         
-        console.error(`[web-search-mcp] DEBUG: Links requested: ${limit}; Successfully extracted: ${successCount}; Failed: ${failedCount}${failureReasonText}; Results: ${enhancedResults.length}.`);
+        console.error(`[web-search-mcp] DEBUG: Links requested: ${limit}; Successfully extracted: ${successCount}; Failed: ${failedCount}${failureReasonText}; Replaced: ${replaced}; Results: ${enhancedResults.length}; ${follow.cache}.`);
         
         // Add extraction info to combined status
-        combinedStatus += `; Successfully extracted: ${successCount}; Failed: ${failedCount}; Results: ${enhancedResults.length}`;
+        combinedStatus += `; Successfully extracted: ${successCount}; Failed: ${failedCount}${replacedText}; Results: ${enhancedResults.length}; ${follow.cache}`;
       }
 
       const searchTime = Date.now() - startTime;
@@ -440,7 +483,12 @@ class WebSearchMCPServer {
 
   private categorizeError(errorMessage: string): string {
     const lowerError = errorMessage.toLowerCase();
-    
+
+    // Checked first: a bot-protection page usually also reports HTTP 403/429, and "Bot detection"
+    // is the actionable category (retry differently), whereas "Access denied" suggests permissions.
+    if (lowerError.includes('interstitial') || lowerError.includes('bot protection') || lowerError.includes('bot-protection') || lowerError.includes('captcha') || lowerError.includes('unusual traffic')) {
+      return 'Bot detection';
+    }
     if (lowerError.includes('timeout') || lowerError.includes('timed out')) {
       return 'Timeout';
     }
@@ -449,9 +497,6 @@ class WebSearchMCPServer {
     }
     if (lowerError.includes('404') || lowerError.includes('not found')) {
       return 'Not found';
-    }
-    if (lowerError.includes('bot') || lowerError.includes('captcha') || lowerError.includes('unusual traffic')) {
-      return 'Bot detection';
     }
     if (lowerError.includes('too large') || lowerError.includes('content length') || lowerError.includes('maxcontentlength')) {
       return 'Content too long';
@@ -483,37 +528,49 @@ class WebSearchMCPServer {
     });
 
     // Graceful shutdown - close browsers when process exits
-    process.on('SIGINT', async () => {
-      console.log('Shutting down gracefully...');
-      try {
-        await Promise.all([
-          this.contentExtractor.closeAll(),
-          this.searchEngine.closeAll()
-        ]);
-      } catch (error) {
-        console.error('Error during graceful shutdown:', error);
-      }
-      process.exit(0);
-    });
+    process.on('SIGINT', () => void this.shutdown('SIGINT'));
+    process.on('SIGTERM', () => void this.shutdown('SIGTERM'));
+    process.on('SIGHUP', () => void this.shutdown('SIGHUP'));
+  }
 
-    process.on('SIGTERM', async () => {
-      console.log('Shutting down gracefully...');
-      try {
-        await Promise.all([
-          this.contentExtractor.closeAll(),
-          this.searchEngine.closeAll()
-        ]);
-      } catch (error) {
-        console.error('Error during graceful shutdown:', error);
-      }
+  private shuttingDown = false;
+
+  /**
+   * Close every browser and exit. Without this the Playwright Chromium processes keep running
+   * under a detached server: an MCP client that dies without signalling (crash, `process.exit()`
+   * in a script) left 2 orphaned servers and ~2 GiB of headless Chrome behind on this machine.
+   */
+  private async shutdown(reason: string): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    console.log(`Shutting down gracefully (${reason})...`);
+
+    const deadline = setTimeout(() => {
+      console.error(`Shutdown deadline reached while closing browsers for ${reason}, exiting anyway`);
       process.exit(0);
-    });
+    }, 5000);
+    // do not keep the event loop alive just for the deadline
+    deadline.unref?.();
+
+    try {
+      await Promise.all([this.contentExtractor.closeAll(), this.searchEngine.closeAll()]);
+    } catch (error) {
+      console.error('Error during graceful shutdown:', error);
+    } finally {
+      clearTimeout(deadline);
+      process.exit(0);
+    }
   }
 
   async run(): Promise<void> {
     console.log('Setting up MCP server...');
     const transport = new StdioServerTransport();
-    
+
+    // The parent's pipe going away is the only signal we get when it dies without signalling
+    // (crash, `process.exit()` in a script): stdin hits EOF and nothing else notices.
+    process.stdin.on('end', () => void this.shutdown('stdin closed by client'));
+    process.stdin.on('close', () => void this.shutdown('stdin closed by client'));
+
     console.log('Connecting to transport...');
     await this.server.connect(transport);
     console.log('Web Search MCP Server started');

@@ -71,24 +71,13 @@ export class SearchEngine {
                 return { results, engine: approach.name };
               }
               
-              // If quality is acceptable and this isn't Bing (first engine), return
-              if (qualityScore >= qualityThreshold && approach.name !== 'Browser Bing' && !forceMultiEngine) {
+              // If quality is acceptable, return immediately (unless forcing multi-engine)
+              if (qualityScore >= qualityThreshold && !forceMultiEngine) {
                 console.log(`[SearchEngine] Good quality results from ${approach.name}, using as primary`);
                 return { results, engine: approach.name };
               }
-              
-              // If this is the last engine or quality is acceptable, prepare to return
-              if (i === approaches.length - 1) {
-                if (bestQuality >= qualityThreshold || !enableQualityCheck) {
-                  console.log(`[SearchEngine] Using best results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
-                  return { results: bestResults, engine: bestEngine };
-                } else if (bestResults.length > 0) {
-                  console.log(`[SearchEngine] Warning: Low quality results from all engines, using best available from ${bestEngine}`);
-                  return { results: bestResults, engine: bestEngine };
-                }
-              } else {
-                console.log(`[SearchEngine] ${approach.name} results quality: ${qualityScore.toFixed(2)}, continuing to try other engines...`);
-              }
+
+              console.log(`[SearchEngine] ${approach.name} results quality: ${qualityScore.toFixed(2)}, continuing to try other engines...`);
             }
           } catch (error) {
             console.error(`[SearchEngine] ${approach.name} approach failed:`, error);
@@ -98,6 +87,13 @@ export class SearchEngine {
           }
         }
         
+        // Return the best results only when they clear the quality threshold,
+        // so a misfired engine's junk results are dropped instead of returned.
+        if (bestResults.length > 0 && (!enableQualityCheck || bestQuality >= qualityThreshold)) {
+          console.log(`[SearchEngine] Using best results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
+          return { results: bestResults, engine: bestEngine };
+        }
+
         console.log(`[SearchEngine] All approaches failed, returning empty results`);
         return { results: [], engine: 'None' };
       });
@@ -127,6 +123,7 @@ export class SearchEngine {
         // Create a dedicated browser instance for Brave search only
         const { firefox } = await import('playwright');
         browser = await firefox.launch({
+          timeout: 5000, // bounded: Firefox Nightly can hang on launch on some macOS setups
           headless: process.env.BROWSER_HEADLESS !== 'false',
           args: [
             '--no-sandbox',
